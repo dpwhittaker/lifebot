@@ -1,4 +1,4 @@
-# Project Overview: "Conversate" Prototype for Galaxy Z Fold 7
+# Project Overview: "LifeBot" Prototype for Galaxy Z Fold 7
 
 ## The Objective
 

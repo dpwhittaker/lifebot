@@ -1,0 +1,13 @@
+[Unit]
+Description=LifeBot APK static server (served via tailnet-proxy at /lifebot/)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m http.server 8003 --bind 127.0.0.1 --directory /home/david/projects/lifebot/.serve
+WorkingDirectory=/home/david/projects/lifebot
+Restart=always
+User=david
+
+[Install]
+WantedBy=multi-user.target

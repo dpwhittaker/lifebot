@@ -1,0 +1,156 @@
+export type GeminiRole = 'user' | 'model';
+
+export type GeminiTurn = {
+  role: GeminiRole;
+  parts: { text: string }[];
+};
+
+export type CueResponse = { cue: string | null };
+
+const SYSTEM_INSTRUCTION = `You are a passive session monitor for an in-person conversation (e.g., a tabletop game, study group, meeting).
+Read the running transcript. If the user mentions a specific factual claim, D&D rule, definition, name, date, formula, or explicitly requests data, output a brief helpful summary.
+Otherwise output null.
+Respond ONLY with JSON of shape {"cue": "..."} or {"cue": null}. Keep cues under 240 characters and skip filler / opinions / chit-chat.`;
+
+const RESPONSE_SCHEMA = {
+  type: 'object',
+  properties: {
+    cue: {
+      type: ['string', 'null'],
+      description: 'A brief contextual cue, or null when no cue is warranted.',
+    },
+  },
+  required: ['cue'],
+} as const;
+
+export type GeminiOrchestratorOptions = {
+  apiKey: string;
+  model?: string;
+  maxHistoryTurns?: number;
+  fetchImpl?: typeof fetch;
+};
+
+export class GeminiOrchestrator {
+  private readonly apiKey: string;
+  private readonly model: string;
+  private readonly maxHistoryTurns: number;
+  private readonly fetchImpl: typeof fetch;
+  private history: GeminiTurn[] = [];
+  private inflight: Promise<CueResponse> | null = null;
+  private queue: string[] = [];
+
+  constructor(opts: GeminiOrchestratorOptions) {
+    this.apiKey = opts.apiKey;
+    this.model = opts.model ?? 'gemini-2.5-flash';
+    this.maxHistoryTurns = opts.maxHistoryTurns ?? 24;
+    this.fetchImpl = opts.fetchImpl ?? fetch;
+  }
+
+  reset() {
+    this.history = [];
+    this.queue = [];
+  }
+
+  async submit(sentence: string): Promise<CueResponse | null> {
+    const clean = sentence.trim();
+    if (!clean) return null;
+
+    if (this.inflight) {
+      this.queue.push(clean);
+      return null;
+    }
+
+    this.inflight = this.evaluate(clean);
+    try {
+      const result = await this.inflight;
+      return result;
+    } finally {
+      this.inflight = null;
+      if (this.queue.length) {
+        const merged = this.queue.join(' ');
+        this.queue = [];
+        void this.submit(merged);
+      }
+    }
+  }
+
+  private async evaluate(sentence: string): Promise<CueResponse> {
+    const turn: GeminiTurn = { role: 'user', parts: [{ text: sentence }] };
+    const contents = [...this.history, turn];
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`;
+    const body = {
+      systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+      contents,
+      generationConfig: {
+        temperature: 0.2,
+        responseMimeType: 'application/json',
+        responseSchema: RESPONSE_SCHEMA,
+      },
+    };
+
+    const res = await this.fetchImpl(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const detail = await safeText(res);
+      throw new Error(`Gemini ${res.status}: ${detail.slice(0, 200)}`);
+    }
+
+    const json = (await res.json()) as GeminiResponse;
+    const text = json.candidates?.[0]?.content?.parts?.[0]?.text ?? '{"cue":null}';
+    const parsed = parseCue(text);
+
+    this.history.push(turn);
+    this.history.push({
+      role: 'model',
+      parts: [{ text: JSON.stringify(parsed) }],
+    });
+    this.trimHistory();
+
+    return parsed;
+  }
+
+  private trimHistory() {
+    const max = this.maxHistoryTurns * 2;
+    if (this.history.length > max) {
+      this.history.splice(0, this.history.length - max);
+    }
+  }
+}
+
+function parseCue(raw: string): CueResponse {
+  try {
+    const parsed = JSON.parse(raw) as Partial<CueResponse>;
+    if (parsed && typeof parsed === 'object' && 'cue' in parsed) {
+      const value = parsed.cue;
+      if (value === null) return { cue: null };
+      if (typeof value === 'string') {
+        const trimmed = value.trim();
+        return { cue: trimmed.length ? trimmed : null };
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return { cue: null };
+}
+
+async function safeText(res: Response): Promise<string> {
+  try {
+    return await res.text();
+  } catch {
+    return '';
+  }
+}
+
+type GeminiResponse = {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{ text?: string }>;
+    };
+  }>;
+};
