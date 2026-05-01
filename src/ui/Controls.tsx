@@ -6,9 +6,16 @@ type Props = {
   geminiConfigured: boolean;
   pendingCues: number;
   onToggle: () => void;
+  onUpdate: () => void;
 };
 
-export function Controls({ active, geminiConfigured, pendingCues, onToggle }: Props) {
+export function Controls({
+  active,
+  geminiConfigured,
+  pendingCues,
+  onToggle,
+  onUpdate,
+}: Props) {
   return (
     <View style={styles.bar}>
       <View style={styles.brand}>
@@ -18,9 +25,7 @@ export function Controls({ active, geminiConfigured, pendingCues, onToggle }: Pr
 
       <View style={styles.center}>
         {!geminiConfigured && (
-          <Text style={styles.warn}>
-            ⚠ EXPO_PUBLIC_GEMINI_API_KEY not set — cues disabled
-          </Text>
+          <Text style={styles.warn}>⚠ GEMINI_API_KEY not set — cues disabled</Text>
         )}
         {pendingCues > 0 && (
           <Text style={styles.pending}>
@@ -29,18 +34,31 @@ export function Controls({ active, geminiConfigured, pendingCues, onToggle }: Pr
         )}
       </View>
 
-      <Pressable
-        onPress={onToggle}
-        style={({ pressed }) => [
-          styles.button,
-          active && styles.buttonActive,
-          pressed && { opacity: 0.7 },
-        ]}
-      >
-        <Text style={[styles.buttonText, active && styles.buttonTextActive]}>
-          {active ? 'Stop Listening' : 'Start Listening'}
-        </Text>
-      </Pressable>
+      <View style={styles.buttons}>
+        <Pressable
+          onPress={onUpdate}
+          style={({ pressed }) => [
+            styles.button,
+            styles.buttonGhost,
+            pressed && { opacity: 0.7 },
+          ]}
+        >
+          <Text style={[styles.buttonText, styles.buttonTextGhost]}>Update</Text>
+        </Pressable>
+
+        <Pressable
+          onPress={onToggle}
+          style={({ pressed }) => [
+            styles.button,
+            active && styles.buttonActive,
+            pressed && { opacity: 0.7 },
+          ]}
+        >
+          <Text style={[styles.buttonText, active && styles.buttonTextActive]}>
+            {active ? 'Stop Listening' : 'Start Listening'}
+          </Text>
+        </Pressable>
+      </View>
     </View>
   );
 }
@@ -59,6 +77,7 @@ const styles = StyleSheet.create({
   center: { flex: 1, alignItems: 'center', gap: 2 },
   warn: { color: theme.warn, fontSize: 12 },
   pending: { color: theme.textMuted, fontSize: 11 },
+  buttons: { flexDirection: 'row', gap: spacing.sm },
   button: {
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.md,
@@ -68,6 +87,8 @@ const styles = StyleSheet.create({
     backgroundColor: 'transparent',
   },
   buttonActive: { backgroundColor: theme.error, borderColor: theme.error },
+  buttonGhost: { borderColor: theme.textMuted },
   buttonText: { color: theme.accent, fontWeight: '700', letterSpacing: 0.5 },
   buttonTextActive: { color: theme.text },
+  buttonTextGhost: { color: theme.textMuted, fontWeight: '600' },
 });

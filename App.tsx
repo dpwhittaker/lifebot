@@ -1,22 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, SafeAreaView, StatusBar, StyleSheet, View } from 'react-native';
-import { GEMINI_API_KEY, GEMINI_MODEL } from '@env';
+import { Alert, Linking, SafeAreaView, StatusBar, StyleSheet, View } from 'react-native';
+import { GEMINI_API_KEY, GEMINI_LIVE_MODEL } from '@env';
 
 import {
-  AudioPipeline,
+  LiveAudioCapture,
   requestMicPermission,
-  type TranscriptChunk,
-} from './src/audio/AudioPipeline';
-import { GeminiOrchestrator } from './src/orchestrator/Gemini';
+} from './src/audio/LiveAudioCapture';
+import { GeminiLiveOrchestrator } from './src/orchestrator/GeminiLive';
 import { bootstrapModels, type BootstrapEvent } from './src/models/bootstrap';
 import { TranscriptPane } from './src/ui/TranscriptPane';
 import { CuePane, type Cue } from './src/ui/CuePane';
 import { BootstrapScreen } from './src/ui/BootstrapScreen';
 import { Controls } from './src/ui/Controls';
+import { OrchestratorLog, type LogEntry } from './src/ui/OrchestratorLog';
 import { spacing, theme } from './src/ui/theme';
+import type { TranscriptChunk } from './src/audio/AudioPipeline';
+import { LogUploader } from './src/util/LogUploader';
 
 const API_KEY: string = GEMINI_API_KEY ?? '';
-const MODEL: string = GEMINI_MODEL ?? 'gemini-2.5-flash';
+const LIVE_MODEL: string = GEMINI_LIVE_MODEL ?? 'gemini-3.1-flash-live-preview';
 
 export default function App() {
   const [bootstrap, setBootstrap] = useState<BootstrapEvent | null>(null);
@@ -24,76 +26,146 @@ export default function App() {
   const [pipelineReady, setPipelineReady] = useState(false);
 
   const [chunks, setChunks] = useState<TranscriptChunk[]>([]);
-  const [partial, setPartial] = useState('');
   const [active, setActive] = useState(false);
   const [vadActive, setVadActive] = useState(false);
 
   const [cues, setCues] = useState<Cue[]>([]);
   const [pendingCues, setPendingCues] = useState(0);
   const cueSeq = useRef(0);
+  const chunkSeq = useRef(0);
 
-  const pipelineRef = useRef<AudioPipeline | null>(null);
-  const orchestratorRef = useRef<GeminiOrchestrator | null>(null);
+  const [log, setLog] = useState<LogEntry[]>([]);
+  const logSeq = useRef(0);
 
-  const evaluateSentence = useCallback(async (sentence: string) => {
-    const orchestrator = orchestratorRef.current;
-    if (!orchestrator) return;
-    setPendingCues((n) => n + 1);
-    try {
-      const result = await orchestrator.submit(sentence);
-      if (result?.cue) {
-        setCues((prev) =>
-          [
-            {
-              id: ++cueSeq.current,
-              text: result.cue!,
-              createdAt: Date.now(),
-              source: sentence,
-            },
-            ...prev,
-          ].slice(0, 50),
-        );
-      }
-    } catch (e) {
-      console.warn('Gemini error', e);
-    } finally {
-      setPendingCues((n) => Math.max(0, n - 1));
-    }
+  const captureRef = useRef<LiveAudioCapture | null>(null);
+  const orchestratorRef = useRef<GeminiLiveOrchestrator | null>(null);
+  const uploaderRef = useRef<LogUploader>(new LogUploader());
+
+  const appendLog = useCallback((entry: Omit<LogEntry, 'id'>) => {
+    const full: LogEntry = { ...entry, id: ++logSeq.current };
+    setLog((prev) => [...prev, full].slice(-200));
+    uploaderRef.current.enqueue(full);
+  }, []);
+
+  useEffect(() => {
+    const uploader = uploaderRef.current;
+    uploader.start();
+    return () => uploader.stop();
   }, []);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const { whisperPath, vadPath } = await bootstrapModels((event) => {
+        const { vadPath } = await bootstrapModels((event) => {
           if (!cancelled) setBootstrap(event);
         });
         if (cancelled) return;
 
-        const pipeline = new AudioPipeline(whisperPath, vadPath, {
-          onPartial: (text) => setPartial(text),
-          onChunk: (chunk) => {
-            setPartial('');
-            setChunks((prev) => [...prev, chunk].slice(-300));
+        if (!API_KEY) {
+          throw new Error('GEMINI_API_KEY not set');
+        }
+
+        const orchestrator = new GeminiLiveOrchestrator({
+          apiKey: API_KEY,
+          model: LIVE_MODEL,
+          onTrace: (event) => {
+            switch (event.type) {
+              case 'connecting':
+                appendLog({ kind: 'sent', at: event.at, text: 'connecting…', meta: LIVE_MODEL });
+                break;
+              case 'connected':
+                appendLog({ kind: 'sent', at: event.at, text: 'WebSocket open' });
+                break;
+              case 'setup_sent':
+                appendLog({ kind: 'sent', at: event.at, text: 'setup sent' });
+                break;
+              case 'setup_complete':
+                appendLog({ kind: 'sent', at: event.at, text: 'setup complete (server)' });
+                break;
+              case 'sent_audio':
+              case 'input_transcript_partial':
+              case 'output_transcript_partial':
+              case 'response_text':
+                // Too noisy.
+                break;
+              case 'turn_complete':
+                appendLog({
+                  kind: 'sent',
+                  at: event.at,
+                  text: `turn: heard "${event.heard.slice(0, 80)}", said "${event.said.slice(0, 80)}"`,
+                });
+                break;
+              case 'error':
+                appendLog({ kind: 'error', at: event.at, text: event.error });
+                break;
+              case 'closed':
+                appendLog({
+                  kind: 'error',
+                  at: event.at,
+                  text: 'connection closed',
+                  meta: event.reason || `code ${event.code ?? '?'}`,
+                });
+                break;
+            }
           },
-          onSentence: (sentence) => {
-            void evaluateSentence(sentence);
+          onResponse: (response) => {
+            if (response.heard) {
+              setChunks((prev) =>
+                [
+                  ...prev,
+                  {
+                    id: ++chunkSeq.current,
+                    text: response.heard ?? '',
+                    startedAt: Date.now(),
+                    finalizedAt: Date.now(),
+                    eventType: 'live' as const,
+                  },
+                ].slice(-300),
+              );
+            }
+            if (response.cue) {
+              const cueText = response.cue;
+              appendLog({
+                kind: 'cue',
+                at: Date.now(),
+                text: cueText,
+                meta: response.heard ?? undefined,
+              });
+              setCues((prev) =>
+                [
+                  {
+                    id: ++cueSeq.current,
+                    text: cueText,
+                    createdAt: Date.now(),
+                    source: response.heard ?? '',
+                  },
+                  ...prev,
+                ].slice(0, 50),
+              );
+            } else {
+              appendLog({
+                kind: 'null',
+                at: Date.now(),
+                text: '(no cue)',
+                meta: response.heard ?? undefined,
+              });
+            }
           },
-          onVad: (event) => {
-            if (event.type === 'speech_start') setVadActive(true);
-            if (event.type === 'speech_end' || event.type === 'silence') setVadActive(false);
+        });
+        orchestratorRef.current = orchestrator;
+
+        const capture = new LiveAudioCapture(vadPath, orchestrator, {
+          onVadActive: (a) => setVadActive(a),
+          onAudioSent: (bytes) => {
+            // Maintain a small "in-flight" counter as a stand-in for activity.
+            setPendingCues((n) => n);
+            void bytes;
           },
           onError: (msg) => Alert.alert('Audio error', msg),
-          onStatusChange: (isActive) => setActive(isActive),
+          onStatusChange: (a) => setActive(a),
         });
-
-        pipelineRef.current = pipeline;
-        if (API_KEY) {
-          orchestratorRef.current = new GeminiOrchestrator({
-            apiKey: API_KEY,
-            model: MODEL,
-          });
-        }
+        captureRef.current = capture;
         setPipelineReady(true);
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -103,15 +175,15 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      void pipelineRef.current?.release();
+      void captureRef.current?.release();
     };
-  }, [evaluateSentence]);
+  }, [appendLog]);
 
   const onToggle = useCallback(async () => {
-    const pipeline = pipelineRef.current;
-    if (!pipeline) return;
-    if (pipeline.isActive) {
-      await pipeline.stop();
+    const capture = captureRef.current;
+    if (!capture) return;
+    if (capture.isActive) {
+      await capture.stop();
       return;
     }
     const ok = await requestMicPermission();
@@ -120,7 +192,7 @@ export default function App() {
       return;
     }
     try {
-      await pipeline.start();
+      await capture.start();
     } catch (e) {
       Alert.alert('Failed to start', e instanceof Error ? e.message : String(e));
     }
@@ -131,6 +203,12 @@ export default function App() {
   }, []);
 
   const onClearCues = useCallback(() => setCues([]), []);
+
+  const onUpdate = useCallback(() => {
+    // Opens the APK URL in the system browser. The browser downloads the
+    // file and shows a notification; tapping it triggers the system installer.
+    void Linking.openURL('https://desktop-uqt6i2t.tail9fb1cb.ts.net/lifebot/lifebot.apk');
+  }, []);
 
   if (!pipelineReady) {
     return (
@@ -149,9 +227,17 @@ export default function App() {
         geminiConfigured={!!API_KEY}
         pendingCues={pendingCues}
         onToggle={onToggle}
+        onUpdate={onUpdate}
       />
       <View style={styles.split}>
-        <TranscriptPane chunks={chunks} partial={partial} active={active} vadActive={vadActive} />
+        <View style={styles.leftColumn}>
+          <View style={styles.transcriptWrap}>
+            <TranscriptPane chunks={chunks} active={active} vadActive={vadActive} />
+          </View>
+          <View style={styles.logWrap}>
+            <OrchestratorLog entries={log} />
+          </View>
+        </View>
         <CuePane cues={cues} onDismiss={onDismissCue} onClear={onClearCues} />
       </View>
     </SafeAreaView>
@@ -165,5 +251,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     paddingHorizontal: spacing.md,
     paddingBottom: spacing.md,
+    gap: spacing.sm,
   },
+  leftColumn: { flex: 1, flexDirection: 'column', gap: spacing.sm },
+  transcriptWrap: { flex: 2 },
+  logWrap: { flex: 1, minHeight: 140 },
 });

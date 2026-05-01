@@ -5,12 +5,11 @@ import type { TranscriptChunk } from '../audio/AudioPipeline';
 
 type Props = {
   chunks: TranscriptChunk[];
-  partial: string;
   active: boolean;
   vadActive: boolean;
 };
 
-export function TranscriptPane({ chunks, partial, active, vadActive }: Props) {
+export function TranscriptPane({ chunks, active, vadActive }: Props) {
   const listRef = useRef<FlatList<TranscriptChunk>>(null);
 
   useEffect(() => {
@@ -18,7 +17,7 @@ export function TranscriptPane({ chunks, partial, active, vadActive }: Props) {
     requestAnimationFrame(() => {
       listRef.current?.scrollToEnd({ animated: true });
     });
-  }, [chunks.length, partial]);
+  }, [chunks.length]);
 
   return (
     <View style={styles.container}>
@@ -37,7 +36,12 @@ export function TranscriptPane({ chunks, partial, active, vadActive }: Props) {
         renderItem={({ item }) => (
           <View style={styles.chunkRow}>
             <Text style={styles.timestamp}>{formatTime(item.finalizedAt)}</Text>
-            <Text style={styles.chunkText}>{item.text}</Text>
+            <View style={styles.chunkBody}>
+              <Text style={styles.chunkText}>{item.text}</Text>
+              {item.eventType && (
+                <Text style={styles.diag}>{formatDiag(item)}</Text>
+              )}
+            </View>
           </View>
         )}
         contentContainerStyle={styles.listContent}
@@ -49,14 +53,6 @@ export function TranscriptPane({ chunks, partial, active, vadActive }: Props) {
                 : 'Tap “Start Listening” to begin transcribing the room.'}
             </Text>
           </View>
-        }
-        ListFooterComponent={
-          partial ? (
-            <View style={[styles.chunkRow, styles.partialRow]}>
-              <Text style={styles.timestamp}>·</Text>
-              <Text style={styles.partialText}>{partial}</Text>
-            </View>
-          ) : null
         }
       />
     </View>
@@ -78,13 +74,33 @@ function formatTime(ms: number): string {
   return d.toTimeString().slice(0, 8);
 }
 
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatDiag(item: TranscriptChunk): string {
+  const parts: string[] = [];
+  if (item.eventType) parts.push(item.eventType);
+  if (item.sliceIndex !== undefined) parts.push(`slice ${item.sliceIndex}`);
+  if (item.isCapturing !== undefined) {
+    parts.push(item.isCapturing ? 'capturing' : 'final');
+  }
+  if (item.recordingTimeMs !== undefined) {
+    parts.push(`${formatMs(item.recordingTimeMs)} audio`);
+  }
+  if (item.processTimeMs !== undefined) {
+    parts.push(`${formatMs(item.processTimeMs)} infer`);
+  }
+  return parts.join(' · ');
+}
+
 const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: theme.panel,
     borderRadius: radius.lg,
     padding: spacing.md,
-    marginRight: spacing.sm,
     borderWidth: 1,
     borderColor: theme.panelEdge,
   },
@@ -117,9 +133,14 @@ const styles = StyleSheet.create({
     paddingTop: 3,
     width: 64,
   },
-  chunkText: { color: theme.text, fontSize: 16, lineHeight: 22, flex: 1 },
-  partialRow: { opacity: 0.6 },
-  partialText: { color: theme.accent, fontSize: 16, lineHeight: 22, flex: 1, fontStyle: 'italic' },
+  chunkBody: { flex: 1 },
+  chunkText: { color: theme.text, fontSize: 16, lineHeight: 22 },
+  diag: {
+    color: theme.textMuted,
+    fontSize: 10,
+    fontVariant: ['tabular-nums'],
+    marginTop: 2,
+  },
   empty: { padding: spacing.xl, alignItems: 'center' },
   emptyText: { color: theme.textMuted, textAlign: 'center', fontSize: 14, lineHeight: 20 },
 });

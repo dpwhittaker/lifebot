@@ -12,22 +12,17 @@ Read the running transcript. If the user mentions a specific factual claim, D&D 
 Otherwise output null.
 Respond ONLY with JSON of shape {"cue": "..."} or {"cue": null}. Keep cues under 240 characters and skip filler / opinions / chit-chat.`;
 
-const RESPONSE_SCHEMA = {
-  type: 'object',
-  properties: {
-    cue: {
-      type: ['string', 'null'],
-      description: 'A brief contextual cue, or null when no cue is warranted.',
-    },
-  },
-  required: ['cue'],
-} as const;
+export type OrchestratorTrace =
+  | { type: 'sent'; id: number; sentence: string; at: number }
+  | { type: 'response'; id: number; cue: string | null; latencyMs: number; rawText: string; at: number }
+  | { type: 'error'; id: number; error: string; latencyMs: number; at: number };
 
 export type GeminiOrchestratorOptions = {
   apiKey: string;
   model?: string;
   maxHistoryTurns?: number;
   fetchImpl?: typeof fetch;
+  onTrace?: (event: OrchestratorTrace) => void;
 };
 
 export class GeminiOrchestrator {
@@ -35,15 +30,18 @@ export class GeminiOrchestrator {
   private readonly model: string;
   private readonly maxHistoryTurns: number;
   private readonly fetchImpl: typeof fetch;
+  private readonly onTrace?: (event: OrchestratorTrace) => void;
   private history: GeminiTurn[] = [];
   private inflight: Promise<CueResponse> | null = null;
   private queue: string[] = [];
+  private traceSeq = 0;
 
   constructor(opts: GeminiOrchestratorOptions) {
     this.apiKey = opts.apiKey;
     this.model = opts.model ?? 'gemini-2.5-flash';
     this.maxHistoryTurns = opts.maxHistoryTurns ?? 24;
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.onTrace = opts.onTrace;
   }
 
   reset() {
@@ -75,6 +73,10 @@ export class GeminiOrchestrator {
   }
 
   private async evaluate(sentence: string): Promise<CueResponse> {
+    const id = ++this.traceSeq;
+    const startedAt = Date.now();
+    this.onTrace?.({ type: 'sent', id, sentence, at: startedAt });
+
     const turn: GeminiTurn = { role: 'user', parts: [{ text: sentence }] };
     const contents = [...this.history, turn];
 
@@ -85,24 +87,53 @@ export class GeminiOrchestrator {
       generationConfig: {
         temperature: 0.2,
         responseMimeType: 'application/json',
-        responseSchema: RESPONSE_SCHEMA,
       },
     };
 
-    const res = await this.fetchImpl(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      this.onTrace?.({
+        type: 'error',
+        id,
+        error: `network: ${error}`,
+        latencyMs: Date.now() - startedAt,
+        at: Date.now(),
+      });
+      throw e;
+    }
 
     if (!res.ok) {
       const detail = await safeText(res);
-      throw new Error(`Gemini ${res.status}: ${detail.slice(0, 200)}`);
+      const error = `Gemini ${res.status}: ${detail.slice(0, 400)}`;
+      this.onTrace?.({
+        type: 'error',
+        id,
+        error,
+        latencyMs: Date.now() - startedAt,
+        at: Date.now(),
+      });
+      throw new Error(error);
     }
 
     const json = (await res.json()) as GeminiResponse;
     const text = json.candidates?.[0]?.content?.parts?.[0]?.text ?? '{"cue":null}';
     const parsed = parseCue(text);
+
+    this.onTrace?.({
+      type: 'response',
+      id,
+      cue: parsed.cue,
+      latencyMs: Date.now() - startedAt,
+      rawText: text,
+      at: Date.now(),
+    });
 
     this.history.push(turn);
     this.history.push({

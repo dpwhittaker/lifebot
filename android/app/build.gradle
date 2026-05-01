@@ -25,7 +25,10 @@ react {
 
     /* Bundling */
     //   A list containing the node command and its flags. Default is just 'node'.
-    // nodeExecutableAndArgs = ["node"]
+    // Pinned to nvm-installed node 24 because metro-config uses Array.toReversed
+    // (ES2023) which the system node 18 lacks. Override LIFEBOT_NODE_BIN to
+    // change.
+    nodeExecutableAndArgs = [System.getenv("LIFEBOT_NODE_BIN") ?: "/home/david/.nvm/versions/node/v24.11.0/bin/node"]
     //
     //   The command to run when bundling. By default is 'bundle'
     // bundleCommand = "ram-bundle"

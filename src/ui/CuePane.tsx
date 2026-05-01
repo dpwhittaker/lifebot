@@ -80,7 +80,6 @@ const styles = StyleSheet.create({
     backgroundColor: theme.panel,
     borderRadius: radius.lg,
     padding: spacing.md,
-    marginLeft: spacing.sm,
     borderWidth: 1,
     borderColor: theme.panelEdge,
   },

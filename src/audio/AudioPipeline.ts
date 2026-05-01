@@ -21,10 +21,15 @@ export type TranscriptChunk = {
   text: string;
   startedAt: number;
   finalizedAt: number;
+  // Optional diagnostics — only present in whisper-mode chunks.
+  eventType?: 'transcribe' | 'end' | 'live';
+  isCapturing?: boolean;
+  sliceIndex?: number;
+  recordingTimeMs?: number;
+  processTimeMs?: number;
 };
 
 export type PipelineCallbacks = {
-  onPartial: (text: string) => void;
   onChunk: (chunk: TranscriptChunk) => void;
   onSentence: (sentence: string) => void;
   onVad?: (event: RealtimeVadEvent) => void;
@@ -66,8 +71,15 @@ export class AudioPipeline {
   private vad?: WhisperVadContext;
   private transcriber?: RealtimeTranscriber;
   private buffer = '';
-  private chunkSeq = 0;
   private active = false;
+  private chunkSeq = 0;
+  // Slice settling: each slice can fire many transcribe events as VAD
+  // re-enqueues. We track the most recent text per slice and flush to the
+  // orchestrator either when a new slice starts or after a quiet window.
+  private currentSliceIndex = -1;
+  private currentSliceText = '';
+  private settleTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly SLICE_SETTLE_MS = 1500;
 
   constructor(
     private readonly whisperModelPath: string,
@@ -100,24 +112,38 @@ export class AudioPipeline {
         audioStream,
       },
       {
-        audioSliceSec: 25,
+        // Short slices so each utterance gets its own slice index. Whisper.rn
+        // re-enqueues transcription on every VAD speech_start/continue/end on
+        // the *current* slice, so we additionally dedup by sliceIndex below.
+        audioSliceSec: 8,
         audioMinSec: 1,
         maxSlicesInMemory: 3,
         autoSliceOnSpeechEnd: true,
+        autoSliceThreshold: 0.2,
+        // audioSource 9 = MediaRecorder.AudioSource.UNPROCESSED — raw mic
+        // input with no DSP gating, gain control, or noise suppression.
+        // VOICE_RECOGNITION (default 6) is tuned for close-talk and actively
+        // suppresses far-field audio, which is wrong for ambient table
+        // capture. Falls back gracefully on devices that don't support it.
+        audioStreamConfig: { audioSource: 9 },
         vadOptions: {
-          threshold: 0.5,
-          minSpeechDurationMs: 300,
+          // Sensitive preset, tuned for ambient room audio rather than
+          // close-talk. Lower threshold = lower amplitude floor for "speech".
+          threshold: 0.3,
+          minSpeechDurationMs: 200,
           minSilenceDurationMs: 600,
-          maxSpeechDurationS: 30,
-          speechPadMs: 50,
-          samplesOverlap: 0.1,
+          maxSpeechDurationS: 8,
+          speechPadMs: 100,
+          samplesOverlap: 0.15,
         },
         transcribeOptions: {
           language: 'en',
           maxLen: 1,
           tokenTimestamps: false,
         },
-        promptPreviousSlices: true,
+        // See note on duplication: prompt-from-previous-slice causes Whisper
+        // to hallucinate prior text into silent windows.
+        promptPreviousSlices: false,
       },
       {
         onTranscribe: (event) => this.handleTranscribe(event),
@@ -138,6 +164,7 @@ export class AudioPipeline {
 
   async stop(): Promise<void> {
     await this.transcriber?.stop();
+    this.flushSettledSlice();
     this.flushBuffer(true);
   }
 
@@ -155,23 +182,48 @@ export class AudioPipeline {
       this.cb.onError?.('transcribe error');
       return;
     }
+    if (event.type !== 'transcribe' && event.type !== 'end') return;
+
     const text = event.data?.result?.trim();
     if (!text) return;
 
-    if (event.type === 'transcribe' && event.isCapturing) {
-      this.cb.onPartial(text);
-      return;
-    }
+    const chunk: TranscriptChunk = {
+      id: ++this.chunkSeq,
+      text,
+      startedAt: Date.now() - event.recordingTime,
+      finalizedAt: Date.now(),
+      eventType: event.type,
+      isCapturing: event.isCapturing,
+      sliceIndex: event.sliceIndex,
+      recordingTimeMs: Math.round(event.recordingTime),
+      processTimeMs: Math.round(event.processTime),
+    };
+    this.cb.onChunk(chunk);
 
-    if (event.type === 'end' || (event.type === 'transcribe' && !event.isCapturing)) {
-      const chunk: TranscriptChunk = {
-        id: ++this.chunkSeq,
-        text,
-        startedAt: Date.now() - event.recordingTime,
-        finalizedAt: Date.now(),
-      };
-      this.cb.onChunk(chunk);
-      this.appendToBuffer(text);
+    // If this is a new slice, the previous one has settled — flush it.
+    if (event.sliceIndex !== this.currentSliceIndex) {
+      this.flushSettledSlice();
+      this.currentSliceIndex = event.sliceIndex;
+    }
+    this.currentSliceText = text;
+
+    // Reset the settle timer; if no new chunk for this slice arrives within
+    // SLICE_SETTLE_MS, treat it as final and flush.
+    if (this.settleTimer) clearTimeout(this.settleTimer);
+    this.settleTimer = setTimeout(
+      () => this.flushSettledSlice(),
+      AudioPipeline.SLICE_SETTLE_MS,
+    );
+  }
+
+  private flushSettledSlice() {
+    if (this.settleTimer) {
+      clearTimeout(this.settleTimer);
+      this.settleTimer = null;
+    }
+    if (this.currentSliceText) {
+      this.appendToBuffer(this.currentSliceText);
+      this.currentSliceText = '';
     }
   }
 
