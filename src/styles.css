@@ -61,6 +61,12 @@ button {
   gap: var(--space-md);
 }
 
+.brand-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
 .brand-text {
   font-size: 22px;
   font-weight: 700;
@@ -70,6 +76,162 @@ button {
   font-size: 11px;
   letter-spacing: 1px;
   color: var(--text-muted);
+}
+
+/* Thread bar (dropdown picker for active thread) */
+.thread-bar { position: relative; min-width: 0; }
+.thread-pill {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--panel-edge);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  letter-spacing: 0.3px;
+  max-width: 280px;
+}
+.thread-pill:hover { border-color: var(--accent); color: var(--accent); }
+.thread-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+.thread-caret { color: var(--text-muted); font-size: 11px; }
+
+.thread-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 50;
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--radius-md);
+  padding: var(--space-sm);
+  min-width: 280px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+}
+.thread-empty {
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: var(--space-sm);
+}
+.thread-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-sm);
+  text-align: left;
+  color: var(--text);
+  font-size: 14px;
+}
+.thread-item:hover { background: var(--accent-soft); }
+.thread-item-active { background: var(--accent-soft); border: 1px solid var(--accent); color: var(--accent); }
+.thread-item-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+.thread-item-meta { color: var(--text-muted); font-size: 11px; margin-left: var(--space-sm); }
+.thread-menu-actions {
+  display: flex;
+  gap: var(--space-sm);
+  border-top: 1px solid var(--panel-edge);
+  margin-top: var(--space-sm);
+  padding-top: var(--space-sm);
+}
+.thread-action {
+  flex: 1;
+  padding: var(--space-sm);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+}
+.thread-action:hover { background: var(--accent-soft); }
+
+/* Modal (thread editor) */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-lg);
+  z-index: 100;
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  width: min(720px, 100%);
+  max-height: 90vh;
+  overflow-y: auto;
+}
+.modal-title { margin: 0; font-size: 20px; font-weight: 700; }
+
+.form-label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+.form-input,
+.form-textarea {
+  background: var(--bg);
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm) var(--space-md);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  text-transform: none;
+  letter-spacing: normal;
+  resize: vertical;
+}
+.form-input:focus,
+.form-textarea:focus { border-color: var(--accent); outline: none; }
+.form-textarea { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 13px; line-height: 1.5; }
+
+.modal-actions {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: var(--space-sm);
+}
+.btn-primary {
+  padding: var(--space-sm) var(--space-lg);
+  border-radius: var(--radius-md);
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-ghost-modal {
+  padding: var(--space-sm) var(--space-lg);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--text-muted);
+  color: var(--text-muted);
+}
+.btn-danger {
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--error);
+  color: var(--error);
 }
 
 .center-status {
@@ -102,15 +264,16 @@ button {
 
 .split {
   flex: 1;
-  display: flex;
-  flex-direction: row;
+  /* Grid with two equal columns — flex was letting wide cue content push the
+     right column past 50%. Grid 1fr 1fr is enforced regardless of content. */
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: var(--space-sm);
   padding: 0 var(--space-md) var(--space-md);
   min-height: 0;
 }
 
 .left-col {
-  flex: 1;
   display: flex;
   flex-direction: column;
   gap: var(--space-sm);
@@ -118,8 +281,16 @@ button {
   min-height: 0;
 }
 
-.transcript-wrap { flex: 2; min-height: 0; }
-.log-wrap { flex: 1; min-height: 140px; }
+/* Transcript and orchestrator log share the left column 50/50, each constrained
+   to its own slot so internal scrollbars handle overflow instead of pushing
+   the column off the page. */
+.transcript-wrap,
+.log-wrap {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 
 .pane {
   background: var(--panel);
@@ -129,7 +300,10 @@ button {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
   flex: 1;
+  /* Stop internal content from forcing the pane wider than its grid track. */
+  overflow: hidden;
 }
 .pane-header {
   display: flex;
@@ -194,6 +368,11 @@ button {
   line-height: 22px;
   word-wrap: break-word;
 }
+.chunk-pending {
+  color: var(--accent);
+  font-style: italic;
+  opacity: 0.85;
+}
 .chunk-diag {
   color: var(--text-muted);
   font-size: 10px;
@@ -220,7 +399,13 @@ button {
 }
 .cue-time { color: var(--accent); font-size: 11px; letter-spacing: 1px; font-weight: 700; }
 .cue-dismiss { color: var(--accent); font-size: 11px; letter-spacing: 1px; }
-.cue-body { color: var(--text); font-size: 16px; line-height: 22px; }
+.cue-body {
+  color: var(--text);
+  font-size: 16px;
+  line-height: 22px;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
 .cue-source {
   color: var(--text-muted);
   font-size: 11px;

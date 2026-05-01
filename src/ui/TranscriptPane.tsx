@@ -4,6 +4,8 @@ export type TranscriptChunk = {
   id: number;
   text: string;
   finalizedAt: number;
+  /** True once the orchestrator committed this turn (cue arrived or soft-commit). */
+  committed?: boolean;
 };
 
 type Props = {
@@ -49,7 +51,7 @@ export function TranscriptPane({ chunks, active, vadActive }: Props) {
             <div className="chunk-row" key={c.id}>
               <div className="timestamp">{formatTime(c.finalizedAt)}</div>
               <div className="chunk-body">
-                <div className="chunk-text">{c.text}</div>
+                <div className={`chunk-text ${c.committed ? '' : 'chunk-pending'}`}>{c.text}</div>
               </div>
             </div>
           ))

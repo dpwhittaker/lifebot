@@ -10,10 +10,19 @@ export type AudioOrchestratorTrace =
       latencyMs: number;
       committed: boolean;
       bufferMsAfter: number;
+      usage?: GeminiUsage;
       at: number;
     }
   | { type: 'error'; error: string; latencyMs: number; at: number }
   | { type: 'soft_commit'; reason: string; bufferMs: number; at: number };
+
+/** Token usage breakdown surfaced from Gemini's usageMetadata. */
+export type GeminiUsage = {
+  promptTokens: number;
+  cachedTokens: number;
+  responseTokens: number;
+  totalTokens: number;
+};
 
 export type AudioResponse = {
   heard: string;
@@ -24,6 +33,8 @@ export type GeminiAudioOptions = {
   apiKey: string;
   model: string;
   systemInstruction?: string;
+  /** Prior committed exchanges to seed the conversation history with. */
+  initialHistory?: Array<{ heard: string; cue: string | null }>;
   /** How many user/model turn pairs of *committed* text history to keep. */
   maxHistoryTurns?: number;
   /**
@@ -35,29 +46,38 @@ export type GeminiAudioOptions = {
   fetchImpl?: typeof fetch;
   onTrace?: (event: AudioOrchestratorTrace) => void;
   onResponse?: (response: AudioResponse) => void;
+  /** Fires every time a turn commits (cue arrives or soft-commit triggers). */
+  onCommit?: (entry: { heard: string; cue: string | null }) => void;
 };
 
 const SAMPLE_RATE = 16000;
 
 const DEFAULT_SYSTEM_INSTRUCTION = `You are a passive session monitor for an in-person conversation (e.g., a tabletop game, study group, meeting).
 
-Each request includes a stretch of audio that may contain multiple speakers, partial words, far-field talk, and silence. Listen carefully — far-field words you can resolve are often the most informative.
+Each request includes a stretch of audio that may contain multiple speakers, partial words, far-field talk, and silence. Listen carefully — far-field words you can resolve are often the most informative. The audio may also include parts you've already heard in earlier turns; that's expected.
 
 Respond with ONLY a JSON object of shape:
-{"heard": "<one-line transcript of what was said in the audio>", "cue": "<short helpful summary>" | null}
+{"heard": "<one-line transcript of all speech in the audio>", "cue": "<the actual answer or fact>" | null}
 
 Rules for "cue":
-- Provide one if and only if a speaker mentioned a specific factual claim, D&D rule, definition, name, date, formula, or explicitly requested data.
-- Keep cues under 240 characters.
-- Otherwise output null. Skip filler / opinions / chit-chat / ambient noise.
+- A cue is for the LISTENER (someone watching the screen) — give them the *answer* or *fact*, not a description of what was asked. If a player asks "what's the AC of a beholder?" the cue is "Beholder AC: 18 (natural armor)", NOT "The speaker asked for the beholder's AC".
+- Produce a cue only when a speaker stated a specific factual claim worth verifying, asked an answerable factual question, mentioned a D&D rule / definition / name / date / formula, or explicitly requested data.
+- Keep cues under 240 characters. Pure information, no narration.
+- Otherwise output null. Skip filler / opinions / chit-chat / ambient noise / questions you can't actually answer.
 
-Always include "heard" — a clean one-line transcript of everything intelligible. Never output anything other than the JSON object.`;
+Always include "heard" — a clean one-line transcript of all intelligible speech in the audio. Never output anything other than the JSON object.`;
 
 type GeminiPart = { text: string } | { inlineData: { mimeType: string; data: string } };
 type GeminiTurn = { role: 'user' | 'model'; parts: GeminiPart[] };
 
 type GeminiResponse = {
   candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  usageMetadata?: {
+    promptTokenCount?: number;
+    cachedContentTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+  };
 };
 
 /**
@@ -91,6 +111,12 @@ export class GeminiAudioOrchestrator {
   /** How many of pendingAudio's frames are part of the in-flight request. */
   private inflightCount = 0;
   private inflight = false;
+  /**
+   * Set true whenever new audio arrives. Cleared at the start of each
+   * evaluate(). If nothing new arrives during a request, we don't loop —
+   * otherwise a `null` response would immediately re-send the same audio.
+   */
+  private dirty = false;
 
   constructor(opts: GeminiAudioOptions) {
     this.opts = opts;
@@ -99,17 +125,30 @@ export class GeminiAudioOrchestrator {
     this.systemInstruction = opts.systemInstruction ?? DEFAULT_SYSTEM_INSTRUCTION;
     const softCommitSec = opts.softCommitSec ?? 300; // 5 minutes
     this.softCommitBytes = softCommitSec * SAMPLE_RATE * 2; // 16-bit mono
+
+    // Seed history from a thread's prior commits, if provided.
+    if (opts.initialHistory) {
+      for (const e of opts.initialHistory) {
+        if (!e.heard) continue;
+        const responseText = JSON.stringify({ heard: e.heard, cue: e.cue });
+        this.history.push({ role: 'user', parts: [{ text: e.heard }] });
+        this.history.push({ role: 'model', parts: [{ text: responseText }] });
+      }
+      this.trimHistory();
+    }
   }
 
   reset(): void {
     this.history = [];
     this.pendingAudio = [];
     this.pendingBytes = 0;
+    this.dirty = false;
   }
 
   sendTurn(pcm: Uint8Array): void {
     this.pendingAudio.push(pcm);
     this.pendingBytes += pcm.byteLength;
+    this.dirty = true;
     void this.processQueue();
   }
 
@@ -118,11 +157,16 @@ export class GeminiAudioOrchestrator {
 
   private async processQueue(): Promise<void> {
     if (this.inflight) return;
-    if (this.pendingAudio.length === 0) return;
+    if (!this.dirty || this.pendingAudio.length === 0) return;
     this.inflight = true;
     try {
-      while (this.pendingAudio.length > 0) {
-        // Snapshot how many frames we're sending in this request.
+      // Loop only while *new* audio keeps arriving. If a request returns
+      // without a cue and no new audio came in, we stop — otherwise we'd
+      // immediately re-send the same payload and burn money in a tight loop.
+      // sendTurn() will set dirty=true and re-trigger processQueue when the
+      // next utterance arrives.
+      while (this.dirty && this.pendingAudio.length > 0) {
+        this.dirty = false;
         this.inflightCount = this.pendingAudio.length;
         await this.evaluate();
         this.inflightCount = 0;
@@ -178,6 +222,10 @@ export class GeminiAudioOrchestrator {
         latencyMs: Date.now() - startedAt,
         at: Date.now(),
       });
+      // Drop the in-flight audio so we don't infinite-retry the same payload
+      // when the network is dead. The user will keep talking; subsequent
+      // utterances start a fresh attempt.
+      this.dropInflight();
       return;
     }
 
@@ -189,12 +237,24 @@ export class GeminiAudioOrchestrator {
         latencyMs: Date.now() - startedAt,
         at: Date.now(),
       });
+      // Drop the in-flight audio. For 4xx the request is broken regardless
+      // (wrong model, bad payload, auth) — retrying will just hammer the API.
+      // For 5xx it's also better to discard one window of audio than to loop.
+      this.dropInflight();
       return;
     }
 
     const json = (await res.json()) as GeminiResponse;
     const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text ?? '{"heard":"","cue":null}';
     const parsed = parseResponse(rawText);
+    const usage: GeminiUsage | undefined = json.usageMetadata
+      ? {
+          promptTokens: json.usageMetadata.promptTokenCount ?? 0,
+          cachedTokens: json.usageMetadata.cachedContentTokenCount ?? 0,
+          responseTokens: json.usageMetadata.candidatesTokenCount ?? 0,
+          totalTokens: json.usageMetadata.totalTokenCount ?? 0,
+        }
+      : undefined;
 
     let committed = false;
     if (parsed.cue) {
@@ -224,6 +284,7 @@ export class GeminiAudioOrchestrator {
       latencyMs: Date.now() - startedAt,
       committed,
       bufferMsAfter: Math.round((this.pendingBytes / 2 / SAMPLE_RATE) * 1000),
+      usage,
       at: Date.now(),
     });
     this.opts.onResponse?.(parsed);
@@ -231,18 +292,34 @@ export class GeminiAudioOrchestrator {
 
   /** Drop the in-flight audio frames and push heard+raw response to history. */
   private commit(heard: string, rawText: string): void {
-    // Remove the frames that were part of the in-flight request, keep the
-    // rest (frames that arrived while we were waiting for the response).
-    const dropped = this.pendingAudio.splice(0, this.inflightCount);
-    let droppedBytes = 0;
-    for (const f of dropped) droppedBytes += f.byteLength;
-    this.pendingBytes -= droppedBytes;
-
+    this.dropInflight();
     if (heard) {
       this.history.push({ role: 'user', parts: [{ text: heard }] });
       this.history.push({ role: 'model', parts: [{ text: rawText }] });
       this.trimHistory();
+      // Surface the commit so the App can persist it to the active thread.
+      try {
+        const parsed = JSON.parse(rawText) as { heard?: string; cue?: string | null };
+        this.opts.onCommit?.({
+          heard,
+          cue: typeof parsed.cue === 'string' ? parsed.cue : null,
+        });
+      } catch {
+        this.opts.onCommit?.({ heard, cue: null });
+      }
     }
+  }
+
+  /**
+   * Remove the frames that were part of the in-flight request, keep the rest
+   * (frames that arrived while we were waiting for the response).
+   */
+  private dropInflight(): void {
+    const dropped = this.pendingAudio.splice(0, this.inflightCount);
+    let droppedBytes = 0;
+    for (const f of dropped) droppedBytes += f.byteLength;
+    this.pendingBytes -= droppedBytes;
+    this.inflightCount = 0;
   }
 
   private trimHistory(): void {

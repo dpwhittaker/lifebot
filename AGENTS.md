@@ -112,7 +112,7 @@ The logs dir is intentionally outside `.serve/` — that dir is the build output
 - **Vite 8 + React 19**: standard modern web stack. `tsconfig.app.json` has `erasableSyntaxOnly: true` (Vite default), which forbids constructor parameter properties (`private readonly opts: ...`); use explicit field declarations + an assigning constructor instead.
 - **`@ricky0123/vad-web`**: Silero v5 VAD in WASM. Requires four asset families in `public/`: `silero_vad_v5.onnx`, `silero_vad_legacy.onnx`, `vad.worklet.bundle.min.js`, plus the `ort-wasm-simd-threaded.{,jsep.}{wasm,mjs}` runtime files from `onnxruntime-web`. They're copied in by hand at the moment; if you bump versions, recopy from `node_modules/`.
 - **`vite-plugin-pwa`**: deliberately not used — the published version (`1.2.0`) doesn't yet support Vite 8. We do "install to home screen" with a hand-written `public/manifest.webmanifest` and no service worker. We don't need offline since Gemini needs network.
-- **Gemini model**: `gemini-2.5-flash` by default (override with `VITE_GEMINI_MODEL`). Any model that accepts audio inlineData works. The system prompt forces a strict JSON `{heard, cue}` response.
+- **Gemini model**: `gemini-3.1-flash-lite-preview` by default (override with `VITE_GEMINI_MODEL`). Picked for its higher free-tier quota and lower per-token cost; any model that accepts audio inlineData works. The system prompt forces a strict JSON `{heard, cue}` response.
 
 ## Intended direction
 

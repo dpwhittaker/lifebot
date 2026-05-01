@@ -1,16 +1,25 @@
+import type { ReactNode } from 'react';
+
 type Props = {
   active: boolean;
   geminiConfigured: boolean;
   pendingCues: number;
   onToggle: () => void;
+  threadBar?: ReactNode;
 };
 
-export function Controls({ active, geminiConfigured, pendingCues, onToggle }: Props) {
+export function Controls({
+  active,
+  geminiConfigured,
+  pendingCues,
+  onToggle,
+  threadBar,
+}: Props) {
   return (
     <div className="controls">
-      <div>
+      <div className="brand-block">
         <div className="brand-text">LifeBot</div>
-        <div className="brand-sub">passive session monitor</div>
+        {threadBar}
       </div>
 
       <div className="center-status">
