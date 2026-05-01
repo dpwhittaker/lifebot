@@ -9,38 +9,40 @@ A passive, real-time session monitor — listens to ambient conversation in the 
 ## Architecture
 
 ```
-┌──────── browser tab (PWA) ────────────────┐    ┌────── cloud ──────┐
-│                                            │    │                    │
-│  mic ▶ getUserMedia                        │    │  Gemini 3.1 Flash  │
-│           │                                │    │  Live (WebSocket)  │
-│           ▼                                │    │                    │
-│  @ricky0123/vad-web                        │    │   ▲                │
-│   (Silero v5 in WASM via onnxruntime-web) │    │   │ {input,output} │
-│           │ onSpeechEnd(audio: Float32)    │    │   │  transcripts   │
-│           ▼                                │    │   │                │
-│  GeminiLiveOrchestrator.sendTurn(pcm)      │ ───┼───┘                │
-│   (Float32 → Int16 → base64 →             │    │                    │
-│    clientContent + turnComplete: true)     │    └────────────────────┘
+┌──────── browser tab (PWA) ────────────────┐    ┌──────── cloud ────────┐
+│                                            │    │                        │
+│  mic ▶ getUserMedia                        │    │  Gemini Flash          │
+│           │                                │    │  generateContent (REST)│
+│           ▼                                │    │                        │
+│  @ricky0123/vad-web                        │    │   ▲    ▼               │
+│   (Silero v5 in WASM via onnxruntime-web) │    │   │  {"heard":"...",   │
+│           │ onSpeechEnd(audio: Float32)    │    │   │   "cue":"..."|null}│
+│           ▼                                │    │   │                    │
+│  GeminiAudioOrchestrator.sendTurn(pcm)     │ ───┼───┘                    │
+│   (Float32 → Int16 → base64 → POST,        │    │                        │
+│    audio inlineData in, JSON text out)     │    └────────────────────────┘
 │           │                                │
 │  ── three panes ──                         │
-│  Transcript: per-turn "heard" text         │
-│  Orchestrator: connection / errors / turns │
+│  Transcript: each turn's "heard" text      │
+│  Orchestrator: per-turn diagnostics        │
 │  Cues: surfaced helpful text from model    │
 │                                            │
 │  LogUploader → POST /lifebot/logs every 5s │
 └────────────────────────────────────────────┘
 ```
 
-The whole pipeline runs in one browser tab. There is no server-side code. Mic capture, VAD, and audio framing all happen in JS. The only network hop is the WebSocket to Gemini Live (and the optional log POSTs back to our own host).
+The whole pipeline runs in one browser tab. There is no server-side code. Mic capture, VAD, and audio framing all happen in JS. Each VAD-detected utterance becomes one POST to Gemini's `generateContent` endpoint with the audio inlined as base64 PCM; Gemini returns `{"heard": "...", "cue": "..." | null}` in one shot. The only other network call is the optional log upload back to our host.
 
-Why we're not using `realtimeInput`: we VAD-gate locally, so we don't continuously stream audio. With `realtimeInput` the server's automatic VAD would never see a clean turn boundary because we just stop sending. `clientContent` with `turnComplete: true` makes the boundary explicit and the response immediate.
+**Why not the Live API:** Live's value is bidirectional streaming with server-side VAD. We deliberately do VAD on the device and ship discrete, complete utterances, so Live's streaming machinery doesn't help us — and Live forces audio output (which we'd throw away while still paying for the tokens). Plain `generateContent` with audio input is cheaper, simpler (no WebSocket lifecycle), and returns text directly.
+
+**Why "cheap" history:** `GeminiAudioOrchestrator` keeps a stateful `contents[]` array so the model has conversation context across turns. Past user turns are rewritten to just their `heard` text after the first response — the audio bytes drop out of history entirely. Cost stays roughly flat as the session lengthens; only the new turn pays the audio-token bill.
 
 ## Repo layout
 
 ```
 src/
   audio/LiveAudioCapture.ts    Mic + Silero VAD wrapper. One emitted turn per utterance.
-  orchestrator/GeminiLive.ts   WebSocket client. Setup, base64 PCM, transcript reassembly.
+  orchestrator/GeminiAudio.ts  REST client. POST per turn, stateful contents[] with cheap history.
   ui/                          Controls + Transcript + Cues + Orchestrator log panes.
   util/base64.ts               Pure-JS Uint8Array → base64 (no Buffer/btoa dependency).
   util/LogUploader.ts          Batches log entries, POSTs every 5s to /lifebot/logs.
@@ -100,12 +102,13 @@ The logs dir is intentionally outside `.serve/` — that dir is the build output
 
 - **Vite 8 + React 19**: standard modern web stack. `tsconfig.app.json` has `erasableSyntaxOnly: true` (Vite default), which forbids constructor parameter properties (`private readonly opts: ...`); use explicit field declarations + an assigning constructor instead.
 - **`@ricky0123/vad-web`**: Silero v5 VAD in WASM. Requires four asset families in `public/`: `silero_vad_v5.onnx`, `silero_vad_legacy.onnx`, `vad.worklet.bundle.min.js`, plus the `ort-wasm-simd-threaded.{,jsep.}{wasm,mjs}` runtime files from `onnxruntime-web`. They're copied in by hand at the moment; if you bump versions, recopy from `node_modules/`.
-- **`vite-plugin-pwa`**: deliberately not used — the published version (`1.2.0`) doesn't yet support Vite 8. We do "install to home screen" with a hand-written `public/manifest.webmanifest` and no service worker. We don't need offline anyway since Gemini Live needs network.
-- **Gemini model**: `gemini-3.1-flash-live-preview` is audio-output only. We request `responseModalities: ['AUDIO']` plus `inputAudioTranscription` and `outputAudioTranscription` so we can read both sides as text and ignore the audio bytes. The system prompt asks for terse responses to keep audio-output cost down.
+- **`vite-plugin-pwa`**: deliberately not used — the published version (`1.2.0`) doesn't yet support Vite 8. We do "install to home screen" with a hand-written `public/manifest.webmanifest` and no service worker. We don't need offline since Gemini needs network.
+- **Gemini model**: `gemini-2.5-flash` by default (override with `VITE_GEMINI_MODEL`). Any model that accepts audio inlineData works. The system prompt forces a strict JSON `{heard, cue}` response.
 
 ## Intended direction
 
-- **Dual-mode (price vs intelligence) switch.** The Live audio path costs ~$0.40/active hour. A future cheap-mode path would use on-device Whisper STT + Gemini Flash text REST (~$0.05–0.10/active hour). The complete RN+Whisper code is preserved in `~/projects/lifebot-rn` (tag `rn-final`) — when we want to re-introduce that path, we lift the orchestrator + bootstrap + audio pipeline from there into a new `src/audio/WhisperCapture.ts` and `src/orchestrator/GeminiText.ts`, with an in-app toggle.
+- **Session summary.** Each turn's `heard` text is written to `~/projects/lifebot/logs/current.log` for free, so the running transcript is always available. A future "summarize" button would read that log (or accumulate transcripts in app state) and fire a one-shot Gemini text request to recap.
+- **Dual-mode (price vs intelligence) switch.** Original plan was on-device Whisper STT + Gemini Flash text for "cheap mode" vs Gemini Live audio for "smart mode". Now that we send audio to Gemini directly via REST, we already get Gemini's high-quality audio understanding at near-Whisper-mode cost — the dual-mode tension is mostly resolved. The Whisper-on-device path stays available in `~/projects/lifebot-rn` (tag `rn-final`) if true offline support ever becomes a requirement.
 - **Backgrounded mic.** The PWA loses mic access when the tab is backgrounded on Android. If passive monitoring with the screen off ever becomes a real requirement, the path forward is either (a) a small Capacitor wrapper around this exact code, or (b) revive the RN snapshot. Don't try to solve it with a Service Worker — SW can't access the mic.
 
 ## Don't
@@ -114,15 +117,16 @@ The logs dir is intentionally outside `.serve/` — that dir is the build output
 - **Don't put the tailnet hostname in source files** (or in the user-facing README). It belongs in the user's bookmark and in the proxy's tailscale config, nowhere else in this repo.
 - **Don't add server-side logic to `.serve/`.** That dir is wiped on every build. The log endpoint lives in the proxy intentionally.
 - **Don't bypass the proxy** to serve the PWA on a different port. Add routes to its `ROUTES` table instead. The proxy owns the `:443` Let's Encrypt cert and the request fan-out.
-- **Don't switch to `realtimeInput` for audio.** Our VAD-gated, silence-skipping pattern needs an explicit turn-complete signal; `clientContent + turnComplete: true` provides it. With `realtimeInput`, the server's auto-VAD would stall waiting for audio that never comes.
+- **Don't switch back to the Live API.** It was the wrong tool for what we're doing — we VAD locally and send discrete utterances, so streaming isn't useful, and Live forces audio output we'd throw away while still paying for the tokens. Plain `generateContent` with audio input is cheaper and simpler. If we ever want bidirectional spoken interaction (model talks back), reconsider — but for passive monitoring, REST wins.
+- **Don't keep audio in the conversation history.** `GeminiAudioOrchestrator` deliberately rewrites past user turns to text after each response — keeping all that base64 audio in `contents[]` would balloon costs over a long session. Past turns become "user said X" so the model still has context.
 
 ## Quick references
 
 | Need to | Look at |
 |---|---|
 | Tune VAD sensitivity | `src/audio/LiveAudioCapture.ts` (positive/negativeSpeechThreshold, redemptionMs, etc.) |
-| Change cue prompt | `src/orchestrator/GeminiLive.ts` (`DEFAULT_SYSTEM_INSTRUCTION`) |
+| Change cue prompt | `src/orchestrator/GeminiAudio.ts` (`DEFAULT_SYSTEM_INSTRUCTION`) |
 | Change UI / theme | `src/styles.css` (CSS variables) and the four pane components |
-| Add a Live API option | `src/orchestrator/GeminiLive.ts` (`sendSetup`) |
+| Change history retention | `GeminiAudioOptions.maxHistoryTurns` |
 | See what the device sent | `tail -f ~/projects/lifebot/logs/current.log` |
 | Revive Whisper / RN path | `~/projects/lifebot-rn` (full git history, `rn-final` tag) |

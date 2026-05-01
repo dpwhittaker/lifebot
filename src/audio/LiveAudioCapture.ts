@@ -1,27 +1,29 @@
 import { MicVAD } from '@ricky0123/vad-web';
-import type { GeminiLiveOrchestrator } from '../orchestrator/GeminiLive';
+import type { GeminiAudioOrchestrator } from '../orchestrator/GeminiAudio';
 
 export type LiveCaptureCallbacks = {
   onVadActive?: (active: boolean) => void;
   onAudioSent?: (bytes: number, at: number) => void;
   onError?: (msg: string) => void;
   onStatusChange?: (active: boolean) => void;
+  /** Per-event VAD trace for debugging (start / end / misfire). */
+  onVadEvent?: (kind: 'speech_start' | 'speech_end' | 'misfire', samples?: number) => void;
 };
 
 /**
  * Captures mic input via @ricky0123/vad-web (Silero in WASM), gates uploads
- * locally so we never stream silence to Gemini Live, and ships each detected
- * utterance as a single clientContent turn via the orchestrator.
+ * locally so we never stream silence to the orchestrator, and ships each
+ * detected utterance as one turn via the orchestrator's sendTurn.
  */
 export class LiveAudioCapture {
   private vad?: MicVAD;
   private active = false;
   private wakeLock: WakeLockSentinel | null = null;
 
-  private readonly orchestrator: GeminiLiveOrchestrator;
+  private readonly orchestrator: GeminiAudioOrchestrator;
   private readonly cb: LiveCaptureCallbacks;
 
-  constructor(orchestrator: GeminiLiveOrchestrator, cb: LiveCaptureCallbacks) {
+  constructor(orchestrator: GeminiAudioOrchestrator, cb: LiveCaptureCallbacks) {
     this.orchestrator = orchestrator;
     this.cb = cb;
   }
@@ -32,7 +34,6 @@ export class LiveAudioCapture {
 
   async start(): Promise<void> {
     if (this.active) return;
-    await this.orchestrator.connect();
 
     if (!this.vad) {
       this.vad = await MicVAD.new({
@@ -46,24 +47,31 @@ export class LiveAudioCapture {
         ortConfig: (ort) => {
           ort.env.wasm.wasmPaths = new URL('./', document.baseURI).href;
         },
-        // VAD heuristics — tuned for ambient room voice rather than close-talk.
-        // Lower threshold = catch quieter speech.
-        positiveSpeechThreshold: 0.5,
-        negativeSpeechThreshold: 0.35,
+        // VAD thresholds — tuned aggressively for ambient room voice. The
+        // negative threshold has to be low enough that background noise
+        // doesn't keep the probability above it forever (which would prevent
+        // onSpeechEnd from ever firing). 0.15 is well below typical
+        // background-noise probabilities (~0.2) but well above clear speech
+        // (~0.7+), so silence gets recognised.
+        positiveSpeechThreshold: 0.45,
+        negativeSpeechThreshold: 0.2,
         minSpeechMs: 150,
-        redemptionMs: 800, // tail before we consider speech ended
+        redemptionMs: 600, // tail before we consider speech ended
         preSpeechPadMs: 200, // pre-roll baked into the audio buffer
         onSpeechStart: () => {
           this.cb.onVadActive?.(true);
+          this.cb.onVadEvent?.('speech_start');
         },
         onSpeechEnd: (audio) => {
           this.cb.onVadActive?.(false);
+          this.cb.onVadEvent?.('speech_end', audio.length);
           const pcm = float32ToInt16(audio);
           this.orchestrator.sendTurn(pcm);
           this.cb.onAudioSent?.(pcm.byteLength, Date.now());
         },
         onVADMisfire: () => {
           this.cb.onVadActive?.(false);
+          this.cb.onVadEvent?.('misfire');
         },
       });
     }

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { LiveAudioCapture } from './audio/LiveAudioCapture';
-import { GeminiLiveOrchestrator } from './orchestrator/GeminiLive';
+import { GeminiAudioOrchestrator } from './orchestrator/GeminiAudio';
 import { Controls } from './ui/Controls';
 import { CuePane, type Cue } from './ui/CuePane';
 import { OrchestratorLog, type LogEntry } from './ui/OrchestratorLog';
@@ -9,9 +9,8 @@ import { TranscriptPane, type TranscriptChunk } from './ui/TranscriptPane';
 import { LogUploader } from './util/LogUploader';
 
 const API_KEY: string = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined) ?? '';
-const LIVE_MODEL: string =
-  (import.meta.env.VITE_GEMINI_LIVE_MODEL as string | undefined) ??
-  'gemini-3.1-flash-live-preview';
+const MODEL: string =
+  (import.meta.env.VITE_GEMINI_MODEL as string | undefined) ?? 'gemini-2.5-flash';
 
 export function App() {
   const [chunks, setChunks] = useState<TranscriptChunk[]>([]);
@@ -27,7 +26,7 @@ export function App() {
   const logSeq = useRef(0);
 
   const captureRef = useRef<LiveAudioCapture | null>(null);
-  const orchestratorRef = useRef<GeminiLiveOrchestrator | null>(null);
+  const orchestratorRef = useRef<GeminiAudioOrchestrator | null>(null);
   const uploaderRef = useRef<LogUploader>(new LogUploader());
 
   const appendLog = useCallback((entry: Omit<LogEntry, 'id'>) => {
@@ -52,44 +51,33 @@ export function App() {
       return;
     }
 
-    const orchestrator = new GeminiLiveOrchestrator({
+    const orchestrator = new GeminiAudioOrchestrator({
       apiKey: API_KEY,
-      model: LIVE_MODEL,
+      model: MODEL,
       onTrace: (event) => {
         switch (event.type) {
-          case 'connecting':
-            appendLog({ kind: 'sent', at: event.at, text: 'connecting…', meta: LIVE_MODEL });
-            break;
-          case 'connected':
-            appendLog({ kind: 'sent', at: event.at, text: 'WebSocket open' });
-            break;
-          case 'setup_sent':
-            appendLog({ kind: 'sent', at: event.at, text: 'setup sent' });
-            break;
-          case 'setup_complete':
-            appendLog({ kind: 'sent', at: event.at, text: 'setup complete (server)' });
-            break;
-          case 'sent_audio':
-          case 'input_transcript_partial':
-          case 'output_transcript_partial':
-          case 'response_text':
-            break;
-          case 'turn_complete':
+          case 'sent':
             appendLog({
               kind: 'sent',
               at: event.at,
-              text: `turn: heard "${event.heard.slice(0, 80)}", said "${event.said.slice(0, 80)}"`,
+              text: `→ Gemini (${(event.bytes / 1024).toFixed(1)} KB audio)`,
+              meta: MODEL,
+            });
+            break;
+          case 'response':
+            appendLog({
+              kind: event.cue ? 'cue' : 'null',
+              at: event.at,
+              text: event.cue ?? '(no cue)',
+              meta: `${event.latencyMs}ms · heard "${event.heard.slice(0, 80)}"`,
             });
             break;
           case 'error':
-            appendLog({ kind: 'error', at: event.at, text: event.error });
-            break;
-          case 'closed':
             appendLog({
               kind: 'error',
               at: event.at,
-              text: 'connection closed',
-              meta: event.reason || `code ${event.code ?? '?'}`,
+              text: event.error,
+              meta: `${event.latencyMs}ms`,
             });
             break;
         }
@@ -108,12 +96,6 @@ export function App() {
           );
         }
         if (response.cue) {
-          appendLog({
-            kind: 'cue',
-            at: Date.now(),
-            text: response.cue,
-            meta: response.heard || undefined,
-          });
           setCues((prev) =>
             [
               {
@@ -125,24 +107,25 @@ export function App() {
               ...prev,
             ].slice(0, 50),
           );
-        } else {
-          appendLog({
-            kind: 'null',
-            at: Date.now(),
-            text: '(no cue)',
-            meta: response.heard || undefined,
-          });
         }
-        setPendingCues(0);
+        setPendingCues((n) => Math.max(0, n - 1));
       },
     });
     orchestratorRef.current = orchestrator;
 
     const capture = new LiveAudioCapture(orchestrator, {
       onVadActive: (a) => setVadActive(a),
-      onAudioSent: (bytes) => {
-        setPendingCues(1);
-        void bytes;
+      onVadEvent: (kind, samples) => {
+        const text =
+          kind === 'speech_start'
+            ? 'VAD: speech start'
+            : kind === 'speech_end'
+              ? `VAD: speech end (${samples ? Math.round((samples / 16000) * 1000) : 0}ms audio)`
+              : 'VAD: misfire (too short to send)';
+        appendLog({ kind: kind === 'misfire' ? 'null' : 'sent', at: Date.now(), text });
+      },
+      onAudioSent: () => {
+        setPendingCues((n) => n + 1);
       },
       onError: (msg) => appendLog({ kind: 'error', at: Date.now(), text: msg }),
       onStatusChange: (a) => setActive(a),

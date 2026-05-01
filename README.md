@@ -2,7 +2,7 @@
 
 Passive session monitor. Listens to ambient conversation in the room — a tabletop game, a study group, a meeting — and surfaces brief contextual cues from a cloud LLM as the conversation unfolds.
 
-It runs entirely as a web app. Audio capture and voice activity detection happen locally in your browser; only detected speech segments are streamed to the Gemini Live API for understanding.
+It runs entirely as a web app. Audio capture and voice activity detection happen locally in your browser; only detected speech segments are sent to a Gemini Flash model for understanding. Each utterance becomes one HTTP request with audio in and `{transcript, cue}` JSON out.
 
 ## How it works
 
@@ -10,7 +10,7 @@ It runs entirely as a web app. Audio capture and voice activity detection happen
 mic ──► getUserMedia ──► Silero VAD (in-browser WASM)
                               │  (only when speech is detected)
                               ▼
-                     Gemini Live (WebSocket)
+                Gemini Flash (REST, audio in → JSON out)
                               │
                               ▼
                   cues + transcript appear in the UI
@@ -18,8 +18,8 @@ mic ──► getUserMedia ──► Silero VAD (in-browser WASM)
 
 You see three panes:
 
-- **Transcript** — what Gemini heard, one row per detected utterance.
-- **Orchestrator** — connection events, per-turn diagnostics, errors.
+- **Transcript** — what Gemini heard, one row per detected utterance. Acts as a free running session transcript that you can summarize later.
+- **Orchestrator** — per-turn diagnostics: bytes sent, cue / no-cue / error, latency.
 - **Cues** — short helpful summaries the model surfaces when something looks like a factual claim, rule, definition, or explicit data request. Chit-chat is silently dropped.
 
 ## Requirements
@@ -90,7 +90,7 @@ If you do want to receive them, any HTTP server that accepts POST to that path a
 ```
 src/
   audio/LiveAudioCapture.ts    Mic + Silero VAD; emits one turn per utterance.
-  orchestrator/GeminiLive.ts   WebSocket client for the Gemini Live API.
+  orchestrator/GeminiAudio.ts  REST client; one POST per utterance, stateful conversation history.
   ui/                          Controls, Transcript, Cues, Orchestrator log.
   util/                        Base64 encoder, log uploader.
   App.tsx                      Wires everything together.
@@ -106,7 +106,7 @@ Your `VITE_GEMINI_API_KEY` ends up inlined into the built JavaScript bundle and 
 ## Limitations
 
 - **Backgrounded tabs**: most mobile browsers pause microphone capture when the tab is backgrounded or the screen sleeps. The app requests a screen wake-lock when listening, but you'll still want the screen on.
-- **Audio cost**: Gemini's Live model is audio-only output. The app asks Gemini for terse responses ("the cue or just the word `null`") to minimize cost, and ignores the audio bytes — but you do pay for the audio output tokens. For an active hour of conversation expect roughly the cost of input + a small amount of output. Check current pricing at <https://ai.google.dev/pricing>.
+- **Cost**: each utterance is one Gemini Flash request — audio in (~3 seconds typical, a few hundred tokens), JSON out (a few dozen tokens). For active conversation expect a small fraction of a cent per utterance, in the low single-digit cents per active hour. Past audio is dropped from the conversation history (only the transcribed text is kept), so cost stays roughly flat as a session lengthens. Check current pricing at <https://ai.google.dev/pricing>.
 
 ## License
 
