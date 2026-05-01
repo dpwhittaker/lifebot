@@ -20,6 +20,14 @@ import {
   saveThread,
 } from './threads/store';
 import { findActiveSchedule, parseSchedule } from './threads/schedule';
+import {
+  ADHOC_GROUP_ID,
+  ensureAdhocGroup,
+  getGroup,
+  listGroups,
+  type Group,
+  type GroupSummary,
+} from './threads/groups';
 import type { Thread, ThreadSummary } from './threads/types';
 
 const API_KEY: string = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined) ?? '';
@@ -66,6 +74,8 @@ export function App() {
   // ---- thread state ----
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [activeThread, setActiveThread] = useState<Thread | null>(null);
+  const [groups, setGroups] = useState<GroupSummary[]>([]);
+  const [activeGroup, setActiveGroup] = useState<Group | null>(null);
   const [editorState, setEditorState] = useState<{
     open: boolean;
     mode: 'create' | 'edit';
@@ -113,19 +123,20 @@ export function App() {
     return () => uploader.stop();
   }, []);
 
-  // ---- initial thread load ----
+  // ---- initial load: groups + threads, ensure Ad-hoc group exists ----
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const list = await listThreads();
+        await ensureAdhocGroup();
+        const [groupList, threadList] = await Promise.all([listGroups(), listThreads()]);
         if (cancelled) return;
-        setThreads(list);
-        threadsRef.current = list;
-        if (list.length > 0) {
-          // Prefer schedule-matching thread, else most recent.
-          const scheduled = findActiveSchedule(list);
-          const pickId = scheduled ? scheduled.threadId : list[0].id;
+        setGroups(groupList);
+        setThreads(threadList);
+        threadsRef.current = threadList;
+        if (threadList.length > 0) {
+          const scheduled = findActiveSchedule(threadList);
+          const pickId = scheduled ? scheduled.threadId : threadList[0].id;
           const t = await getThread(pickId);
           if (!cancelled && t) setActiveThread(t);
         }
@@ -133,7 +144,7 @@ export function App() {
         appendLog({
           kind: 'error',
           at: Date.now(),
-          text: `failed to load threads: ${e instanceof Error ? e.message : String(e)}`,
+          text: `failed to load: ${e instanceof Error ? e.message : String(e)}`,
         });
       }
     })();
@@ -141,6 +152,23 @@ export function App() {
       cancelled = true;
     };
   }, [appendLog]);
+
+  // Load active thread's group whenever the thread changes (for roster/people).
+  useEffect(() => {
+    let cancelled = false;
+    const gid = activeThread?.group ?? ADHOC_GROUP_ID;
+    void (async () => {
+      try {
+        const g = await getGroup(gid);
+        if (!cancelled) setActiveGroup(g);
+      } catch {
+        if (!cancelled) setActiveGroup(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeThread]);
 
   // Keep refs in sync.
   useEffect(() => {
@@ -474,7 +502,8 @@ export function App() {
   const onSaveEditor = useCallback(
     async (form: {
       name: string;
-      group: string;
+      groupId: string;
+      roster: string[];
       systemPrompt: string;
       context: string;
       summary: string;
@@ -494,7 +523,8 @@ export function App() {
       const next: Thread = {
         id,
         name: form.name,
-        group: form.group || undefined,
+        group: form.groupId || ADHOC_GROUP_ID,
+        roster: form.roster.length > 0 ? form.roster : undefined,
         systemPrompt: form.systemPrompt,
         context: form.context,
         summary: form.summary || undefined,
@@ -566,16 +596,21 @@ export function App() {
 
   const onClearCues = useCallback(() => setCues([]), []);
 
-  const knownGroups = Array.from(
-    new Set(threads.map((t) => t.group?.trim()).filter((g): g is string => !!g)),
-  ).sort();
-
   const editorInitial =
     editorState.mode === 'edit'
       ? activeThread
       : editorState.prefill
         ? ({ name: editorState.prefill.name } as Partial<Thread>)
         : null;
+
+  const refreshGroups = useCallback(async () => {
+    try {
+      setGroups(await listGroups());
+    } catch {
+      // non-fatal
+    }
+  }, []);
+  void activeGroup; // active group state will be consumed by Phase 2 (voiceprint injection)
 
   return (
     <div className="app">
@@ -629,12 +664,13 @@ export function App() {
       {editorState.open && (
         <ThreadEditor
           initial={editorInitial}
-          knownGroups={knownGroups}
+          groups={groups}
           onSave={onSaveEditor}
           onCancel={() => setEditorState({ open: false, mode: 'create' })}
           onDelete={
             editorState.mode === 'edit' && activeThread ? onDeleteCurrentThread : undefined
           }
+          onGroupsChanged={refreshGroups}
         />
       )}
     </div>

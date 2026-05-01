@@ -309,6 +309,73 @@ button {
   border: 1px solid var(--error);
   color: var(--error);
 }
+.btn-small { padding: var(--space-xs) var(--space-sm); font-size: 12px; }
+
+.row-tight {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+}
+.row-tight .form-input { flex: 1; }
+
+/* People list inside the thread editor */
+.people-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--space-sm);
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  text-transform: none;
+  letter-spacing: normal;
+}
+.people-empty {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-style: italic;
+  padding: var(--space-xs) var(--space-sm);
+}
+.person-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+.person-check {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--text);
+  font-size: 14px;
+}
+.person-check:hover { background: var(--accent-soft); }
+.person-name { color: var(--text); }
+.person-role {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-style: italic;
+}
+.person-remove {
+  color: var(--text-muted);
+  font-size: 16px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+}
+.person-remove:hover { color: var(--error); background: rgba(239, 98, 98, 0.1); }
+.person-add {
+  color: var(--accent);
+  text-align: left;
+  padding: var(--space-xs) var(--space-sm);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
+}
+.person-add:hover { background: var(--accent-soft); }
 
 .center-status {
   flex: 1;

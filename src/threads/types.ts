@@ -9,8 +9,13 @@
 export type Thread = {
   id: string;
   name: string;
-  /** Optional grouping label — e.g. "Work", "Church", "Personal". */
+  /**
+   * Group id (slug) — references an entity in /lifebot/groups/. The Ad-hoc
+   * group is the default for unscheduled, uncategorised conversations.
+   */
   group?: string;
+  /** Person ids within the thread's group. Used for diarization. */
+  roster?: string[];
   systemPrompt: string;
   /** Optional free-text background context — paste rulebooks, syllabi, etc. */
   context?: string;
@@ -59,6 +64,7 @@ export type ThreadSummary = {
   id: string;
   name: string;
   group?: string;
+  roster?: string[];
   schedule?: ScheduleEntry[];
   /** Editable thread summary (character names, recent events, etc.). */
   summary?: string;
