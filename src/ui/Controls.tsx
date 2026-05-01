@@ -1,94 +1,38 @@
-import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { radius, spacing, theme } from './theme';
-
 type Props = {
   active: boolean;
   geminiConfigured: boolean;
   pendingCues: number;
   onToggle: () => void;
-  onUpdate: () => void;
 };
 
-export function Controls({
-  active,
-  geminiConfigured,
-  pendingCues,
-  onToggle,
-  onUpdate,
-}: Props) {
+export function Controls({ active, geminiConfigured, pendingCues, onToggle }: Props) {
   return (
-    <View style={styles.bar}>
-      <View style={styles.brand}>
-        <Text style={styles.brandText}>LifeBot</Text>
-        <Text style={styles.brandSub}>passive session monitor</Text>
-      </View>
+    <div className="controls">
+      <div>
+        <div className="brand-text">LifeBot</div>
+        <div className="brand-sub">passive session monitor</div>
+      </div>
 
-      <View style={styles.center}>
+      <div className="center-status">
         {!geminiConfigured && (
-          <Text style={styles.warn}>⚠ GEMINI_API_KEY not set — cues disabled</Text>
+          <div className="status-warn">⚠ VITE_GEMINI_API_KEY not set — cues disabled</div>
         )}
         {pendingCues > 0 && (
-          <Text style={styles.pending}>
+          <div className="status-pending">
             {pendingCues} request{pendingCues === 1 ? '' : 's'} in flight…
-          </Text>
+          </div>
         )}
-      </View>
+      </div>
 
-      <View style={styles.buttons}>
-        <Pressable
-          onPress={onUpdate}
-          style={({ pressed }) => [
-            styles.button,
-            styles.buttonGhost,
-            pressed && { opacity: 0.7 },
-          ]}
+      <div className="btn-row">
+        <button
+          type="button"
+          className={`btn ${active ? 'btn-active' : ''}`}
+          onClick={onToggle}
         >
-          <Text style={[styles.buttonText, styles.buttonTextGhost]}>Update</Text>
-        </Pressable>
-
-        <Pressable
-          onPress={onToggle}
-          style={({ pressed }) => [
-            styles.button,
-            active && styles.buttonActive,
-            pressed && { opacity: 0.7 },
-          ]}
-        >
-          <Text style={[styles.buttonText, active && styles.buttonTextActive]}>
-            {active ? 'Stop Listening' : 'Start Listening'}
-          </Text>
-        </Pressable>
-      </View>
-    </View>
+          {active ? 'Stop Listening' : 'Start Listening'}
+        </button>
+      </div>
+    </div>
   );
 }
-
-const styles = StyleSheet.create({
-  bar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.md,
-  },
-  brand: { gap: 2 },
-  brandText: { color: theme.text, fontSize: 22, fontWeight: '700', letterSpacing: 0.6 },
-  brandSub: { color: theme.textMuted, fontSize: 11, letterSpacing: 1 },
-  center: { flex: 1, alignItems: 'center', gap: 2 },
-  warn: { color: theme.warn, fontSize: 12 },
-  pending: { color: theme.textMuted, fontSize: 11 },
-  buttons: { flexDirection: 'row', gap: spacing.sm },
-  button: {
-    paddingHorizontal: spacing.lg,
-    paddingVertical: spacing.md,
-    borderRadius: radius.md,
-    borderWidth: 1,
-    borderColor: theme.accent,
-    backgroundColor: 'transparent',
-  },
-  buttonActive: { backgroundColor: theme.error, borderColor: theme.error },
-  buttonGhost: { borderColor: theme.textMuted },
-  buttonText: { color: theme.accent, fontWeight: '700', letterSpacing: 0.5 },
-  buttonTextActive: { color: theme.text },
-  buttonTextGhost: { color: theme.textMuted, fontWeight: '600' },
-});

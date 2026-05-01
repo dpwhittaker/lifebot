@@ -4,133 +4,125 @@ Read this before making changes. It's the orientation doc for anyone (human or a
 
 ## What it is
 
-A passive, real-time, on-device session monitor — listens to ambient conversation (tabletop game, study group, meeting), transcribes locally with Whisper, and pushes contextual cues from a cloud LLM to a dual-pane UI on the Galaxy Z Fold 7's inner display.
-
-Originally scoped in `PLAN.md` (under the working name "Conversate"). Now branded **LifeBot**.
+A passive, real-time session monitor — listens to ambient conversation in the room, surfaces brief contextual cues from a cloud LLM. Originally scoped in `PLAN.md` (under the working name "Conversate"). Currently a browser-only PWA; the previous React Native incarnation lives at `~/projects/lifebot-rn` and on the `rn-final` git tag if it ever needs to be revived.
 
 ## Architecture
 
 ```
-┌──────── on-device ────────┐    ┌─────── cloud ──────┐
-│                            │    │                    │
-│  mic ▶ AudioPcmStream      │    │  Gemini 2.5 Flash  │
-│         │                  │    │  (text, REST)      │
-│         ▼                  │    │                    │
-│  whisper.rn RealtimeXcb    │    │   ▲                │
-│   ├─ Silero VAD (gating)   │    │   │ {cue}|null     │
-│   └─ ggml-tiny.en (STT)    │    │   │                │
-│         │                  │    └───┼────────────────┘
-│         ▼                  │        │
-│  semantic batcher          │ ───────┘
-│   (terminal punctuation +  │   complete sentence
-│    abbreviation guard)     │
-│         │                  │
-│         ▼                  │
-│  cue stack (UI right pane) │
-│  rolling transcript (left) │
-└────────────────────────────┘
+┌──────── browser tab (PWA) ────────────────┐    ┌────── cloud ──────┐
+│                                            │    │                    │
+│  mic ▶ getUserMedia                        │    │  Gemini 3.1 Flash  │
+│           │                                │    │  Live (WebSocket)  │
+│           ▼                                │    │                    │
+│  @ricky0123/vad-web                        │    │   ▲                │
+│   (Silero v5 in WASM via onnxruntime-web) │    │   │ {input,output} │
+│           │ onSpeechEnd(audio: Float32)    │    │   │  transcripts   │
+│           ▼                                │    │   │                │
+│  GeminiLiveOrchestrator.sendTurn(pcm)      │ ───┼───┘                │
+│   (Float32 → Int16 → base64 →             │    │                    │
+│    clientContent + turnComplete: true)     │    └────────────────────┘
+│           │                                │
+│  ── three panes ──                         │
+│  Transcript: per-turn "heard" text         │
+│  Orchestrator: connection / errors / turns │
+│  Cues: surfaced helpful text from model    │
+│                                            │
+│  LogUploader → POST /lifebot/logs every 5s │
+└────────────────────────────────────────────┘
 ```
 
-Two-pane landscape UI sized for the Fold 7 inner display:
+The whole pipeline runs in one browser tab. There is no server-side code. Mic capture, VAD, and audio framing all happen in JS. The only network hop is the WebSocket to Gemini Live (and the optional log POSTs back to our own host).
 
-- **Left pane** — rolling transcript (FlatList of `TranscriptChunk`, plus a partial-result line styled italic)
-- **Right pane** — newest-first stack of dismissible cue cards
-
-The Whisper VAD is what makes "smart batching" cheap: silence between speech is filtered out acoustically, then we wait for terminal punctuation before sending to Gemini. Sentences without `. ! ?` accumulate; single-token abbreviations (`Mr.`, `Dr.`, `etc.`) don't false-trigger.
+Why we're not using `realtimeInput`: we VAD-gate locally, so we don't continuously stream audio. With `realtimeInput` the server's automatic VAD would never see a clean turn boundary because we just stop sending. `clientContent` with `turnComplete: true` makes the boundary explicit and the response immediate.
 
 ## Repo layout
 
 ```
-App.tsx                         entry point, owns transcript/cue state
-src/audio/AudioPipeline.ts      whisper.rn wiring, VAD config, semantic batcher
-src/orchestrator/Gemini.ts      REST client, stateful contents history, queue
-src/models/bootstrap.ts         downloads ggml-tiny.en + ggml-silero on first run
-src/ui/                         TranscriptPane / CuePane / Controls / BootstrapScreen / theme
-android/                        full native project (no Expo)
-.env                            EXPO-style env vars consumed via @env (gitignored)
-.serve/                         APK + landing page served at /lifebot/ (gitignored)
-lifebot-static.service          systemd unit for .serve/ over :8003
-PLAN.md                         original product brief
+src/
+  audio/LiveAudioCapture.ts    Mic + Silero VAD wrapper. One emitted turn per utterance.
+  orchestrator/GeminiLive.ts   WebSocket client. Setup, base64 PCM, transcript reassembly.
+  ui/                          Controls + Transcript + Cues + Orchestrator log panes.
+  util/base64.ts               Pure-JS Uint8Array → base64 (no Buffer/btoa dependency).
+  util/LogUploader.ts          Batches log entries, POSTs every 5s to /lifebot/logs.
+  App.tsx                      Wires capture + orchestrator + UI + log upload.
+  main.tsx                     Vite entry.
+  styles.css                   Theme tokens + global styles.
+public/                        Shipped as-is by Vite. VAD model, ORT WASM, manifest.
+index.html                     Vite entry HTML.
+vite.config.ts                 Build → .serve/, base './' (works under any path).
+.env                           VITE_GEMINI_API_KEY etc. Gitignored.
+.env.example                   Template committed to the repo.
+.serve/                        npm run build output. Gitignored.
+logs/                          Where uploaded device logs land. Gitignored.
+PLAN.md                        Original product brief.
+README.md                      Public-facing setup instructions.
 ```
 
-## Build & deploy
+## Dev workflow
 
-The whole build runs locally on this WSL2 host. No Expo, no EAS, no cloud round-trip.
-
-```bash
-# one-time: SDK + JDK already installed under ~/Android/Sdk and /usr/lib/jvm/java-17-openjdk-amd64
-# subsequent rebuilds (caches from previous build are reused → ~1-2 min):
-
-cd /home/david/projects/lifebot
-JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
-ANDROID_HOME=/home/david/Android/Sdk \
-PATH=$JAVA_HOME/bin:$PATH \
-  android/gradlew -p android assembleRelease
-
-cp android/app/build/outputs/apk/release/app-release.apk .serve/lifebot.apk
+```sh
+npm run dev               # vite, http://localhost:5174 (or LAN IP)
+npm run build             # tsc -b && vite build → .serve/
+npm run preview           # serve .serve/ for a quick prod check
 ```
 
-That's it — the APK is now live at `https://desktop-uqt6i2t.tail9fb1cb.ts.net/lifebot/`.
+Iteration is essentially: edit, save, browser HMRs the change. No install dialog, no APK, no emulator.
 
-First build was 22 min (cold NDK/CMake compile across 4 ABIs for whisper.cpp). Incremental builds skip nearly all of that.
+## Deployment (private tailnet)
 
-The release variant uses the debug keystore (`android/app/build.gradle` `signingConfigs.debug`) — fine for prototype distribution to the user's own device, not fine for Play Store.
+The build output is a static site and is served by the existing `lifebot-static.service` (`python3 -m http.server 8003 --directory .serve`). That service is fronted by the path-routed reverse proxy at `~/projects/proxy/` (read its AGENTS.md for the full story).
 
-## Tailnet serving
-
-LifeBot piggybacks on the existing tailnet proxy at `desktop-uqt6i2t.tail9fb1cb.ts.net:443`. See `~/projects/proxy/AGENTS.md` for the full proxy story; the LifeBot-specific delta:
+Relevant routes on the proxy:
 
 | URL | Backend | Notes |
 |---|---|---|
-| `/lifebot/` | `127.0.0.1:8003` (`lifebot-static.service`) | Prefix stripped. Serves `~/projects/lifebot/.serve/`. |
+| `/lifebot/` | `127.0.0.1:8003` (`lifebot-static.service`) | Serves `.serve/` after `npm run build`. Prefix stripped. |
+| `POST /lifebot/logs` | handled by the proxy itself | Appends body lines to `~/projects/lifebot/logs/current.log`. |
 
-```bash
-systemctl is-active lifebot-static.service tailnet-proxy.service
-journalctl -u lifebot-static.service -f
-sudo systemctl restart lifebot-static.service   # after editing .serve/ contents (rarely needed; python http.server picks up file changes live)
+The tailnet hostname is *not* committed anywhere in this repo (per the `gpu-server` SSH alias convention in `~/.claude/CLAUDE.md`). Use `gpu-server` or `<gpu-host>` when documenting publicly. The user's own browser bookmark holds the real FQDN.
+
+To redeploy after a code change:
+
+```sh
+npm run build
+# That's it. python http.server picks up new files immediately. No restart.
 ```
 
-Updating the proxy route lives in `proxy/server.js` — adding `/lifebot` was a single entry in the `ROUTES` array. Don't put LifeBot-specific logic in the proxy.
+If you change anything in `public/` (icons, manifest, VAD model), they get copied as-is.
 
-## Native config notes
+## Log upload
 
-- **minSdk 26** (`android/build.gradle`) — required by `react-native-fs` and various RN 0.85 stack pieces; also drops 32-bit-only devices we don't care about.
-- **NDK 27.1.12297006** — pinned via `android/build.gradle ext.ndkVersion`. whisper.cpp's CMake build uses this.
-- **Landscape-only** — `android:screenOrientation="landscape"` on `MainActivity`, optimized for the Fold 7 inner display.
-- **Keep-screen-on** — `MainActivity.onCreate` adds `FLAG_KEEP_SCREEN_ON`. We initially used `react-native-keep-awake` but it's unmaintained (jcenter, gradle 3.x); a single `addFlags` call replaced it cleanly.
-- **Permissions** — `RECORD_AUDIO`, `INTERNET`, `WAKE_LOCK`, `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MICROPHONE`. Manifest declares them; `AudioPipeline.requestMicPermission()` requests `RECORD_AUDIO` at runtime.
+Runtime device-side events (connection state, per-turn transcripts, errors) get POSTed in 5-second batches to `/lifebot/logs`. The proxy handler in `~/projects/proxy/server.js` writes each line to `~/projects/lifebot/logs/current.log` with a server-side timestamp prefix. `tail -f` it for live device debugging.
 
-## Dependency quirks
+The logs dir is intentionally outside `.serve/` — that dir is the build output and gets emptied on every `npm run build`.
 
-A few things not obvious from the code:
+## Key dep choices
 
-- **`whisper.rn` package.json `exports` is malformed** — the `react-native` condition value (`"src/*"`) is missing the leading `./`, which makes Metro fail to resolve deep subpaths like `whisper.rn/realtime-transcription/adapters/AudioPcmStreamAdapter`. Fix: `metro.config.js` sets `resolver.unstable_enablePackageExports = false`, falling back to legacy field-based resolution. Imports use the explicit `whisper.rn/src/...` path. If you ever upgrade whisper.rn and the exports field gets fixed upstream, you can flip exports back on and shorten the imports.
-- **Env vars use `react-native-dotenv`** — not `react-native-config`, not Expo's `EXPO_PUBLIC_` convention. The babel plugin reads `.env` at build time and inlines via the virtual `@env` module. New env vars need a line in `env.d.ts` to be type-safe.
-- **No prebuilt `Orchestrator` interface yet** — `App.tsx` currently calls `GeminiOrchestrator.submit()` directly. The dual-mode plan (below) will introduce an interface so the App can pick which one to instantiate.
+- **Vite 8 + React 19**: standard modern web stack. `tsconfig.app.json` has `erasableSyntaxOnly: true` (Vite default), which forbids constructor parameter properties (`private readonly opts: ...`); use explicit field declarations + an assigning constructor instead.
+- **`@ricky0123/vad-web`**: Silero v5 VAD in WASM. Requires four asset families in `public/`: `silero_vad_v5.onnx`, `silero_vad_legacy.onnx`, `vad.worklet.bundle.min.js`, plus the `ort-wasm-simd-threaded.{,jsep.}{wasm,mjs}` runtime files from `onnxruntime-web`. They're copied in by hand at the moment; if you bump versions, recopy from `node_modules/`.
+- **`vite-plugin-pwa`**: deliberately not used — the published version (`1.2.0`) doesn't yet support Vite 8. We do "install to home screen" with a hand-written `public/manifest.webmanifest` and no service worker. We don't need offline anyway since Gemini Live needs network.
+- **Gemini model**: `gemini-3.1-flash-live-preview` is audio-output only. We request `responseModalities: ['AUDIO']` plus `inputAudioTranscription` and `outputAudioTranscription` so we can read both sides as text and ignore the audio bytes. The system prompt asks for terse responses to keep audio-output cost down.
 
 ## Intended direction
 
-Two near-term things on deck:
-
-1. **In-app price-vs-intelligence switch.** The current Gemini Flash text path costs ~$0.05–0.10 per active hour. A future "intelligence mode" will stream raw audio to **Gemini Live** (3.1 Flash Live Preview or successor) for ~$0.40/active hour — same orchestrator role, but the audio carries tone / multiple speakers / hesitation that text loses. The switch lives in app settings, not env vars; users pick per-session based on what the conversation needs.
-2. **VAD-gated audio uploads.** When in intelligence mode, we *still* run local Whisper VAD to detect speech windows — but instead of using the transcribed text, we throw it away and stream the underlying audio bytes to Gemini Live. Skipping silent windows cuts the input bill substantially while preserving the "listen to actual audio" property.
-
-Refactor needed before implementing these: a thin `Orchestrator` interface so `GeminiOrchestrator` (text) and a future `GeminiLiveOrchestrator` (audio) are interchangeable from the App's perspective. The `AudioPipeline` callbacks (`onSentence`, `onChunk`, raw VAD events with audio data) already provide enough signal for both paths; the wiring just needs to fan out to the active orchestrator.
+- **Dual-mode (price vs intelligence) switch.** The Live audio path costs ~$0.40/active hour. A future cheap-mode path would use on-device Whisper STT + Gemini Flash text REST (~$0.05–0.10/active hour). The complete RN+Whisper code is preserved in `~/projects/lifebot-rn` (tag `rn-final`) — when we want to re-introduce that path, we lift the orchestrator + bootstrap + audio pipeline from there into a new `src/audio/WhisperCapture.ts` and `src/orchestrator/GeminiText.ts`, with an in-app toggle.
+- **Backgrounded mic.** The PWA loses mic access when the tab is backgrounded on Android. If passive monitoring with the screen off ever becomes a real requirement, the path forward is either (a) a small Capacitor wrapper around this exact code, or (b) revive the RN snapshot. Don't try to solve it with a Service Worker — SW can't access the mic.
 
 ## Don't
 
-- **Don't reintroduce Expo / EAS** — we deliberately exited that path. The build pipeline is local NDK/Gradle and that's a feature, not a constraint.
-- **Don't rip out on-device Whisper to "simplify."** Even though Live audio would let us remove the model download, NDK build, and VAD logic, we keep Whisper for offline support, privacy, and the cost-floor it gives us. See `dual_mode_plan` memory.
-- **Don't bypass `tailnet-proxy.service`** to serve the APK directly. Add routes to its `ROUTES` table instead. The proxy owns the `:443` Let's Encrypt cert and the request fan-out; orphan listeners on adjacent ports just create EADDRINUSE drama.
-- **Don't ship the release APK with the debug keystore** to anywhere but the developer's own device. If this ever leaves the tailnet, generate a real signing key.
+- **Don't commit `.env`.** It holds the Gemini API key.
+- **Don't put the tailnet hostname in source files** (or in the user-facing README). It belongs in the user's bookmark and in the proxy's tailscale config, nowhere else in this repo.
+- **Don't add server-side logic to `.serve/`.** That dir is wiped on every build. The log endpoint lives in the proxy intentionally.
+- **Don't bypass the proxy** to serve the PWA on a different port. Add routes to its `ROUTES` table instead. The proxy owns the `:443` Let's Encrypt cert and the request fan-out.
+- **Don't switch to `realtimeInput` for audio.** Our VAD-gated, silence-skipping pattern needs an explicit turn-complete signal; `clientContent + turnComplete: true` provides it. With `realtimeInput`, the server's auto-VAD would stall waiting for audio that never comes.
 
 ## Quick references
 
 | Need to | Look at |
 |---|---|
-| Change Whisper batching | `src/audio/AudioPipeline.ts` (VAD options, sentence detection regex) |
-| Change cue prompt | `src/orchestrator/Gemini.ts` (`SYSTEM_INSTRUCTION`) |
-| Change UI / theme | `src/ui/theme.ts` and the four pane components |
-| Add a permission | `android/app/src/main/AndroidManifest.xml` |
-| Bump whisper / VAD model | `src/models/bootstrap.ts` (`WHISPER_MODEL`, `VAD_MODEL`) |
-| Edit Gemini history retention | `GeminiOrchestrator` `maxHistoryTurns` |
+| Tune VAD sensitivity | `src/audio/LiveAudioCapture.ts` (positive/negativeSpeechThreshold, redemptionMs, etc.) |
+| Change cue prompt | `src/orchestrator/GeminiLive.ts` (`DEFAULT_SYSTEM_INSTRUCTION`) |
+| Change UI / theme | `src/styles.css` (CSS variables) and the four pane components |
+| Add a Live API option | `src/orchestrator/GeminiLive.ts` (`sendSetup`) |
+| See what the device sent | `tail -f ~/projects/lifebot/logs/current.log` |
+| Revive Whisper / RN path | `~/projects/lifebot-rn` (full git history, `rn-final` tag) |

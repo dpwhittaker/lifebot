@@ -1,8 +1,4 @@
-import { PermissionsAndroid, Platform } from 'react-native';
-import { initWhisperVad, type WhisperVadContext } from 'whisper.rn';
-import { AudioPcmStreamAdapter } from 'whisper.rn/src/realtime-transcription/adapters/AudioPcmStreamAdapter';
-import type { AudioStreamData } from 'whisper.rn/src/realtime-transcription';
-import { base64FromUint8 } from '../util/base64';
+import { MicVAD } from '@ricky0123/vad-web';
 import type { GeminiLiveOrchestrator } from '../orchestrator/GeminiLive';
 
 export type LiveCaptureCallbacks = {
@@ -12,220 +8,121 @@ export type LiveCaptureCallbacks = {
   onStatusChange?: (active: boolean) => void;
 };
 
-export async function requestMicPermission(): Promise<boolean> {
-  if (Platform.OS !== 'android') return true;
-  const granted = await PermissionsAndroid.request(
-    PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-    {
-      title: 'LifeBot needs your microphone',
-      message: 'LifeBot listens to ambient conversation to surface contextual cues.',
-      buttonPositive: 'Allow',
-    },
-  );
-  return granted === PermissionsAndroid.RESULTS.GRANTED;
-}
-
-const SAMPLE_RATE = 16000;
-const BYTES_PER_SAMPLE = 2;
-const VAD_WINDOW_MS = 500;
-const VAD_WINDOW_BYTES = (VAD_WINDOW_MS / 1000) * SAMPLE_RATE * BYTES_PER_SAMPLE;
-// Pre-roll: send the last ~250ms of audio when speech starts so we don't
-// chop off the beginning of the first word.
-const PRE_ROLL_WINDOWS = 1;
-// Send N silence windows after speech ends (trailing capture).
-const TAIL_WINDOWS = 2;
-
+/**
+ * Captures mic input via @ricky0123/vad-web (Silero in WASM), gates uploads
+ * locally so we never stream silence to Gemini Live, and ships each detected
+ * utterance as a single clientContent turn via the orchestrator.
+ */
 export class LiveAudioCapture {
-  private vad?: WhisperVadContext;
-  private audioStream?: AudioPcmStreamAdapter;
-  private isCapturing = false;
-  private vadInferring = false;
-  private speechActive = false;
-  private silenceCount = 0;
+  private vad?: MicVAD;
+  private active = false;
+  private wakeLock: WakeLockSentinel | null = null;
 
-  // Accumulator until we have a full VAD window.
-  private accum: Uint8Array[] = [];
-  private accumBytes = 0;
+  private readonly orchestrator: GeminiLiveOrchestrator;
+  private readonly cb: LiveCaptureCallbacks;
 
-  // Ring buffer for pre-roll (audio just before VAD said yes).
-  private preRoll: Uint8Array[] = [];
-
-  // Per-utterance buffer: every window during a speech segment + pre-roll +
-  // tail. Flushed as one clientContent turn on speech end.
-  private utterance: Uint8Array[] = [];
-  private utteranceBytes = 0;
-  private static readonly MAX_UTTERANCE_BYTES =
-    30 * SAMPLE_RATE * BYTES_PER_SAMPLE; // 30s safety cap
-
-  constructor(
-    private readonly vadModelPath: string,
-    private readonly orchestrator: GeminiLiveOrchestrator,
-    private readonly cb: LiveCaptureCallbacks,
-  ) {}
-
-  get isActive() {
-    return this.isCapturing;
+  constructor(orchestrator: GeminiLiveOrchestrator, cb: LiveCaptureCallbacks) {
+    this.orchestrator = orchestrator;
+    this.cb = cb;
   }
 
-  async init(): Promise<void> {
-    if (this.vad && this.audioStream) return;
-
-    this.vad = await initWhisperVad({
-      filePath: this.vadModelPath,
-      useGpu: true,
-    });
-
-    this.audioStream = new AudioPcmStreamAdapter();
-    this.audioStream.onData((data) => this.handleAudioData(data));
-    this.audioStream.onStatusChange((active) => {
-      this.isCapturing = active;
-      this.cb.onStatusChange?.(active);
-    });
-    this.audioStream.onError((err) => this.cb.onError?.(err));
+  get isActive() {
+    return this.active;
   }
 
   async start(): Promise<void> {
-    if (!this.audioStream) await this.init();
+    if (this.active) return;
     await this.orchestrator.connect();
-    await this.audioStream!.initialize({
-      sampleRate: SAMPLE_RATE,
-      channels: 1,
-      bitsPerSample: 16,
-      // UNPROCESSED — raw mic, no AGC/noise gating, for ambient capture.
-      audioSource: 9,
-      bufferSize: 16 * 1024,
-    });
-    await this.audioStream!.start();
+
+    if (!this.vad) {
+      this.vad = await MicVAD.new({
+        // Silero v5 is the modern default; "legacy" is more permissive on
+        // far-field. Try v5 first; if it misses ambient table conversation,
+        // swap to "legacy".
+        model: 'v5',
+        // ONNX Runtime defaults to fetching its wasm files from a path
+        // relative to the bundled JS (which Vite puts under /assets/), but
+        // we ship them at the document base. Point ort at the right place.
+        ortConfig: (ort) => {
+          ort.env.wasm.wasmPaths = new URL('./', document.baseURI).href;
+        },
+        // VAD heuristics — tuned for ambient room voice rather than close-talk.
+        // Lower threshold = catch quieter speech.
+        positiveSpeechThreshold: 0.5,
+        negativeSpeechThreshold: 0.35,
+        minSpeechMs: 150,
+        redemptionMs: 800, // tail before we consider speech ended
+        preSpeechPadMs: 200, // pre-roll baked into the audio buffer
+        onSpeechStart: () => {
+          this.cb.onVadActive?.(true);
+        },
+        onSpeechEnd: (audio) => {
+          this.cb.onVadActive?.(false);
+          const pcm = float32ToInt16(audio);
+          this.orchestrator.sendTurn(pcm);
+          this.cb.onAudioSent?.(pcm.byteLength, Date.now());
+        },
+        onVADMisfire: () => {
+          this.cb.onVadActive?.(false);
+        },
+      });
+    }
+
+    this.vad.start();
+    this.active = true;
+    this.cb.onStatusChange?.(true);
+    await this.requestWakeLock();
   }
 
   async stop(): Promise<void> {
-    await this.audioStream?.stop();
+    this.vad?.pause();
+    this.active = false;
+    this.cb.onStatusChange?.(false);
+    this.cb.onVadActive?.(false);
+    this.releaseWakeLock();
     this.orchestrator.close();
-    this.resetState();
   }
 
   async release(): Promise<void> {
     await this.stop();
-    await this.audioStream?.release();
-    await this.vad?.release();
-    this.audioStream = undefined;
+    this.vad?.destroy();
     this.vad = undefined;
   }
 
-  private resetState() {
-    this.accum = [];
-    this.accumBytes = 0;
-    this.preRoll = [];
-    this.utterance = [];
-    this.utteranceBytes = 0;
-    this.speechActive = false;
-    this.silenceCount = 0;
-  }
-
-  private handleAudioData(data: AudioStreamData) {
-    this.accum.push(data.data);
-    this.accumBytes += data.data.length;
-    if (this.accumBytes < VAD_WINDOW_BYTES) return;
-
-    const window = this.flushAccum();
-    void this.processWindow(window);
-  }
-
-  private flushAccum(): Uint8Array {
-    const out = new Uint8Array(this.accumBytes);
-    let offset = 0;
-    for (const c of this.accum) {
-      out.set(c, offset);
-      offset += c.length;
-    }
-    this.accum = [];
-    this.accumBytes = 0;
-    return out;
-  }
-
-  private async processWindow(window: Uint8Array) {
-    // If a previous VAD inference is still in flight, just attribute this
-    // window to the current speech state (don't drop it on the floor —
-    // continue/end the current segment).
-    if (this.vadInferring) {
-      if (this.speechActive) this.appendUtterance(window);
-      this.pushPreRoll(window);
-      return;
-    }
-    this.vadInferring = true;
-
-    let hasSpeech = false;
+  private async requestWakeLock() {
+    if (typeof navigator === 'undefined') return;
+    const wl: WakeLock | undefined = (navigator as { wakeLock?: WakeLock }).wakeLock;
+    if (!wl) return;
     try {
-      const segments = await this.vad!.detectSpeechData(
-        base64FromUint8(window) as any,
-        {
-          threshold: 0.3,
-          minSpeechDurationMs: 150,
-          minSilenceDurationMs: 200,
-          maxSpeechDurationS: 30,
-          speechPadMs: 30,
-          samplesOverlap: 0.1,
-        },
-      );
-      hasSpeech = Array.isArray(segments) && segments.length > 0;
+      this.wakeLock = await wl.request('screen');
     } catch (e) {
-      this.cb.onError?.(`VAD: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      this.vadInferring = false;
+      this.cb.onError?.(`wake lock: ${e instanceof Error ? e.message : String(e)}`);
     }
-
-    if (hasSpeech) {
-      if (!this.speechActive) {
-        this.speechActive = true;
-        this.cb.onVadActive?.(true);
-        for (const chunk of this.preRoll) {
-          this.appendUtterance(chunk);
-        }
-      }
-      this.silenceCount = 0;
-      this.appendUtterance(window);
-    } else if (this.speechActive) {
-      this.silenceCount += 1;
-      if (this.silenceCount <= TAIL_WINDOWS) {
-        this.appendUtterance(window);
-      } else {
-        this.flushUtterance();
-        this.speechActive = false;
-        this.cb.onVadActive?.(false);
-      }
-    }
-
-    if (this.utteranceBytes >= LiveAudioCapture.MAX_UTTERANCE_BYTES) {
-      // Safety cap — long monologues get sliced at 30s and flushed as a turn.
-      this.flushUtterance();
-      this.speechActive = false;
-      this.cb.onVadActive?.(false);
-    }
-
-    this.pushPreRoll(window);
   }
 
-  private pushPreRoll(window: Uint8Array) {
-    this.preRoll.push(window);
-    if (this.preRoll.length > PRE_ROLL_WINDOWS) this.preRoll.shift();
+  private releaseWakeLock() {
+    void this.wakeLock?.release();
+    this.wakeLock = null;
   }
+}
 
-  private appendUtterance(chunk: Uint8Array) {
-    this.utterance.push(chunk);
-    this.utteranceBytes += chunk.length;
+/** Convert a Float32 mono PCM frame (-1..1) to little-endian Int16 bytes. */
+function float32ToInt16(input: Float32Array): Uint8Array {
+  const out = new Uint8Array(input.length * 2);
+  const view = new DataView(out.buffer);
+  for (let i = 0; i < input.length; i++) {
+    let s = input[i];
+    if (s > 1) s = 1;
+    else if (s < -1) s = -1;
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
   }
+  return out;
+}
 
-  private flushUtterance() {
-    if (this.utteranceBytes === 0) return;
-    const out = new Uint8Array(this.utteranceBytes);
-    let offset = 0;
-    for (const c of this.utterance) {
-      out.set(c, offset);
-      offset += c.length;
-    }
-    this.utterance = [];
-    this.utteranceBytes = 0;
-    this.orchestrator.sendTurn(out);
-    this.cb.onAudioSent?.(out.length, Date.now());
-  }
+// Minimal Wake Lock typings — TS lib doesn't always include them.
+interface WakeLock {
+  request(type: 'screen'): Promise<WakeLockSentinel>;
+}
+interface WakeLockSentinel {
+  release(): Promise<void>;
 }

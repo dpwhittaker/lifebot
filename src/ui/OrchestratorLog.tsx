@@ -1,6 +1,4 @@
 import { useEffect, useRef } from 'react';
-import { FlatList, StyleSheet, Text, View } from 'react-native';
-import { radius, spacing, theme } from './theme';
 
 export type LogEntry = {
   id: number;
@@ -13,55 +11,54 @@ export type LogEntry = {
 type Props = { entries: LogEntry[] };
 
 export function OrchestratorLog({ entries }: Props) {
-  const listRef = useRef<FlatList<LogEntry>>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (entries.length === 0) return;
-    requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
+    requestAnimationFrame(() => {
+      const el = bodyRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
   }, [entries.length]);
 
   return (
-    <View style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.title}>Orchestrator</Text>
-        <Text style={styles.sub}>{entries.length} events</Text>
-      </View>
-      <FlatList
-        ref={listRef}
-        data={entries}
-        keyExtractor={(e) => `${e.id}-${e.kind}`}
-        renderItem={({ item }) => <Row entry={item} />}
-        contentContainerStyle={styles.listContent}
-        ListEmptyComponent={
-          <Text style={styles.empty}>
-            Waiting for the first complete sentence to evaluate…
-          </Text>
-        }
-      />
-    </View>
+    <div className="pane log-pane">
+      <div className="pane-header">
+        <div className="pane-title">Orchestrator</div>
+        <span className="brand-sub">{entries.length} events</span>
+      </div>
+
+      <div className="pane-body" ref={bodyRef}>
+        {entries.length === 0 ? (
+          <div className="pane-empty">Waiting for the first complete utterance to evaluate…</div>
+        ) : (
+          entries.map((e) => <Row key={`${e.id}-${e.kind}`} entry={e} />)
+        )}
+      </div>
+    </div>
   );
 }
 
 function Row({ entry }: { entry: LogEntry }) {
-  const color =
+  const colorClass =
     entry.kind === 'cue'
-      ? theme.good
+      ? 'color-good'
       : entry.kind === 'error'
-        ? theme.error
+        ? 'color-error'
         : entry.kind === 'sent'
-          ? theme.accent
-          : theme.textMuted;
+          ? 'color-accent'
+          : 'color-muted';
   const glyph =
     entry.kind === 'sent' ? '→' : entry.kind === 'cue' ? '✓' : entry.kind === 'null' ? '·' : '✗';
   return (
-    <View style={styles.row}>
-      <Text style={styles.timestamp}>{formatTime(entry.at)}</Text>
-      <Text style={[styles.glyph, { color }]}>{glyph}</Text>
-      <View style={styles.body}>
-        <Text style={[styles.text, { color }]}>{entry.text}</Text>
-        {entry.meta && <Text style={styles.meta}>{entry.meta}</Text>}
-      </View>
-    </View>
+    <div className="log-row">
+      <span className="timestamp">{formatTime(entry.at)}</span>
+      <span className={`log-glyph ${colorClass}`}>{glyph}</span>
+      <div className="chunk-body">
+        <div className={`log-text ${colorClass}`}>{entry.text}</div>
+        {entry.meta && <div className="log-meta">{entry.meta}</div>}
+      </div>
+    </div>
   );
 }
 
@@ -69,36 +66,3 @@ function formatTime(ms: number): string {
   const d = new Date(ms);
   return d.toTimeString().slice(0, 8);
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: theme.panel,
-    borderRadius: radius.lg,
-    padding: spacing.md,
-    borderWidth: 1,
-    borderColor: theme.panelEdge,
-  },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: spacing.sm,
-  },
-  title: { color: theme.text, fontSize: 14, fontWeight: '600', letterSpacing: 0.4 },
-  sub: { color: theme.textMuted, fontSize: 11 },
-  listContent: { paddingBottom: spacing.md, gap: 4 },
-  row: { flexDirection: 'row', gap: spacing.sm, alignItems: 'flex-start' },
-  timestamp: {
-    color: theme.textMuted,
-    fontVariant: ['tabular-nums'],
-    fontSize: 11,
-    paddingTop: 2,
-    width: 60,
-  },
-  glyph: { fontSize: 13, fontWeight: '700', width: 14, textAlign: 'center' },
-  body: { flex: 1 },
-  text: { fontSize: 12, lineHeight: 16 },
-  meta: { color: theme.textMuted, fontSize: 10, marginTop: 1, fontStyle: 'italic' },
-  empty: { color: theme.textMuted, fontSize: 12, textAlign: 'center', padding: spacing.lg },
-});

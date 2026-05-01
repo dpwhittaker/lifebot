@@ -1,6 +1,9 @@
 import type { LogEntry } from '../ui/OrchestratorLog';
 
-const ENDPOINT = 'https://desktop-uqt6i2t.tail9fb1cb.ts.net/lifebot/logs';
+// Default endpoint is relative — works whether served from /lifebot/ on the
+// tailnet or from `vite dev` on a port. Override via VITE_LIFEBOT_LOG_URL.
+const ENDPOINT =
+  (import.meta.env.VITE_LIFEBOT_LOG_URL as string | undefined) ?? '/lifebot/logs';
 const FLUSH_INTERVAL_MS = 5000;
 const MAX_BATCH = 100;
 const MAX_QUEUE = 500;

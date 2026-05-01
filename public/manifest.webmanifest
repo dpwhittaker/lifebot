@@ -1,0 +1,11 @@
+{
+  "name": "LifeBot",
+  "short_name": "LifeBot",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#0b0d10",
+  "theme_color": "#0b0d10",
+  "description": "Passive session monitor — listens to ambient conversation and surfaces contextual cues."
+}

@@ -44,8 +44,11 @@ export class GeminiLiveOrchestrator {
   // Per-turn buffers for streaming transcriptions
   private inputBuffer = '';
   private outputBuffer = '';
+  private readonly opts: GeminiLiveOptions;
 
-  constructor(private readonly opts: GeminiLiveOptions) {}
+  constructor(opts: GeminiLiveOptions) {
+    this.opts = opts;
+  }
 
   isConnected(): boolean {
     return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
