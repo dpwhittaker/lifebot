@@ -2,12 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { LiveAudioCapture } from './audio/LiveAudioCapture';
 import { GeminiAudioOrchestrator } from './orchestrator/GeminiAudio';
+import { classifyConversation, type ClassifierResult } from './orchestrator/Classifier';
 import { Controls } from './ui/Controls';
 import { CuePane, type Cue } from './ui/CuePane';
 import { OrchestratorLog, type LogEntry } from './ui/OrchestratorLog';
 import { TranscriptPane, type TranscriptChunk } from './ui/TranscriptPane';
 import { ThreadBar } from './ui/ThreadBar';
 import { ThreadEditor } from './ui/ThreadEditor';
+import { ClassifierBanner } from './ui/ClassifierBanner';
 import { LogUploader } from './util/LogUploader';
 import {
   appendCommit,
@@ -17,6 +19,7 @@ import {
   makeThreadId,
   saveThread,
 } from './threads/store';
+import { findActiveSchedule, parseSchedule } from './threads/schedule';
 import type { Thread, ThreadSummary } from './threads/types';
 
 const API_KEY: string = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined) ?? '';
@@ -28,8 +31,6 @@ function formatSeconds(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-/** Build the system instruction by combining the thread's prompt with its
- *  optional background context. Falls back to defaults when nothing is set. */
 function composeSystemPrompt(thread: Thread | null): string | undefined {
   if (!thread) return undefined;
   const parts: string[] = [];
@@ -41,16 +42,46 @@ function composeSystemPrompt(thread: Thread | null): string | undefined {
   return parts.length ? parts.join('\n\n') : undefined;
 }
 
+/** Compact directory of OTHER threads — for cross-thread awareness without bleed.
+ *  Includes each thread's optional summary so the model can produce passing
+ *  reference cues ("your D&D character Brennan would…") without switching. */
+function composeThreadDirectory(
+  active: Thread | null,
+  all: ThreadSummary[],
+): string | undefined {
+  const others = all.filter((t) => t.id !== active?.id);
+  if (others.length === 0) return undefined;
+  return others
+    .map((t) => {
+      const grp = t.group ? ` [${t.group}]` : '';
+      const summary = t.summary?.trim() ? `\n    ${t.summary.trim().replace(/\n+/g, ' ')}` : '';
+      return `- ${t.name}${grp}${summary}`;
+    })
+    .join('\n');
+}
+
+type ScheduleNow = { threadId: string; untilMs: number; untilLabel: string } | null;
+
 export function App() {
-  // Thread state
+  // ---- thread state ----
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [activeThread, setActiveThread] = useState<Thread | null>(null);
-  const [editorState, setEditorState] = useState<{ open: boolean; mode: 'create' | 'edit' }>({
-    open: false,
-    mode: 'create',
-  });
+  const [editorState, setEditorState] = useState<{
+    open: boolean;
+    mode: 'create' | 'edit';
+    prefill?: { name?: string };
+  }>({ open: false, mode: 'create' });
 
-  // Pipeline state
+  // Schedule auto-activation. `overrideUntilMs` blocks auto-switch during the
+  // current scheduled window when the user manually picks a different thread.
+  const [scheduleNow, setScheduleNow] = useState<ScheduleNow>(null);
+  const overrideUntilMsRef = useRef<number>(0);
+
+  // Classifier banner state. Only one classifier call per session.
+  const [classifier, setClassifier] = useState<ClassifierResult | null>(null);
+  const classifierFiredRef = useRef(false);
+
+  // ---- pipeline state ----
   const [chunks, setChunks] = useState<TranscriptChunk[]>([]);
   const [active, setActive] = useState(false);
   const [vadActive, setVadActive] = useState(false);
@@ -67,6 +98,7 @@ export function App() {
   const orchestratorRef = useRef<GeminiAudioOrchestrator | null>(null);
   const uploaderRef = useRef<LogUploader>(new LogUploader());
   const activeThreadIdRef = useRef<string | null>(null);
+  const threadsRef = useRef<ThreadSummary[]>([]);
 
   const appendLog = useCallback((entry: Omit<LogEntry, 'id'>) => {
     const full: LogEntry = { ...entry, id: ++logSeq.current };
@@ -74,14 +106,14 @@ export function App() {
     uploaderRef.current.enqueue(full);
   }, []);
 
-  // Periodic log uploader.
+  // ---- log uploader ----
   useEffect(() => {
     const uploader = uploaderRef.current;
     uploader.start();
     return () => uploader.stop();
   }, []);
 
-  // Initial thread load.
+  // ---- initial thread load ----
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -89,9 +121,13 @@ export function App() {
         const list = await listThreads();
         if (cancelled) return;
         setThreads(list);
+        threadsRef.current = list;
         if (list.length > 0) {
-          const top = await getThread(list[0].id);
-          if (!cancelled && top) setActiveThread(top);
+          // Prefer schedule-matching thread, else most recent.
+          const scheduled = findActiveSchedule(list);
+          const pickId = scheduled ? scheduled.threadId : list[0].id;
+          const t = await getThread(pickId);
+          if (!cancelled && t) setActiveThread(t);
         }
       } catch (e) {
         appendLog({
@@ -106,7 +142,55 @@ export function App() {
     };
   }, [appendLog]);
 
-  // (Re)build orchestrator + capture whenever the active thread changes.
+  // Keep refs in sync.
+  useEffect(() => {
+    threadsRef.current = threads;
+  }, [threads]);
+  useEffect(() => {
+    activeThreadIdRef.current = activeThread?.id ?? null;
+  }, [activeThread]);
+
+  // ---- schedule polling ----
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      const now = Date.now();
+      const sched = findActiveSchedule(threadsRef.current);
+      if (sched) {
+        const untilMs = sched.until.getTime();
+        const untilLabel = sched.until.toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+        });
+        setScheduleNow({ threadId: sched.threadId, untilMs, untilLabel });
+
+        // Auto-switch unless the user has explicitly overridden this window.
+        if (
+          activeThreadIdRef.current !== sched.threadId &&
+          now >= overrideUntilMsRef.current
+        ) {
+          // Stop any active capture before swapping context.
+          void captureRef.current?.stop().then(() => {
+            void getThread(sched.threadId).then((t) => {
+              if (t) setActiveThread(t);
+            });
+          });
+        }
+      } else {
+        setScheduleNow(null);
+        overrideUntilMsRef.current = 0;
+      }
+    };
+    tick();
+    const id = setInterval(tick, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  // ---- (re)build orchestrator + capture on active thread change ----
   useEffect(() => {
     if (!API_KEY) {
       appendLog({
@@ -117,14 +201,18 @@ export function App() {
       return;
     }
 
-    activeThreadIdRef.current = activeThread?.id ?? null;
     setChunks([]);
     setCues([]);
+    setClassifier(null);
+    classifierFiredRef.current = false;
+
+    const directory = composeThreadDirectory(activeThread, threads);
 
     const orchestrator = new GeminiAudioOrchestrator({
       apiKey: API_KEY,
       model: MODEL,
       systemInstruction: composeSystemPrompt(activeThread),
+      threadDirectory: directory,
       initialHistory: activeThread?.history ?? [],
       onTrace: (event) => {
         switch (event.type) {
@@ -173,6 +261,17 @@ export function App() {
                   },
                 ].slice(-300);
               });
+              // Auto-classify on first heard text — only when no schedule put
+              // us here (we trust the schedule when it applies) and we have at
+              // least one alternative thread to potentially switch to.
+              if (
+                !classifierFiredRef.current &&
+                !scheduleNow &&
+                threadsRef.current.length > 0
+              ) {
+                classifierFiredRef.current = true;
+                void runClassifier(event.heard);
+              }
             }
             break;
           }
@@ -211,9 +310,6 @@ export function App() {
         setPendingCues((n) => Math.max(0, n - 1));
       },
       onCommit: (entry) => {
-        // Persist commits to the thread's history server-side. Non-blocking;
-        // if the server is unreachable, the next session won't see this turn
-        // but the in-memory orchestrator still has it.
         const tid = activeThreadIdRef.current;
         if (!tid) return;
         void appendCommit(tid, entry).catch((e) => {
@@ -268,8 +364,51 @@ export function App() {
       captureRef.current = null;
       orchestratorRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeThread, appendLog]);
 
+  // ---- classifier ----
+  const runClassifier = useCallback(
+    async (heard: string) => {
+      const others = threadsRef.current.filter((t) => t.id !== activeThreadIdRef.current);
+      if (others.length === 0) return;
+      try {
+        const result = await classifyConversation(
+          { apiKey: API_KEY, model: MODEL },
+          others,
+          heard,
+        );
+        if (result.kind === 'match') {
+          // Only show banner if the match is a *different* thread AND we're
+          // confident. Lower-confidence matches are likely passing references.
+          appendLog({
+            kind: 'sent',
+            at: Date.now(),
+            text: `classifier: match → ${result.threadId} (${result.confidence})`,
+          });
+          if (result.threadId === activeThreadIdRef.current) return;
+          if (result.confidence !== 'high') return;
+          setClassifier(result);
+        } else if (result.kind === 'new') {
+          appendLog({
+            kind: 'sent',
+            at: Date.now(),
+            text: `classifier: new topic suggested${result.suggestedName ? ` (${result.suggestedName})` : ''}`,
+          });
+          setClassifier(result);
+        }
+      } catch (e) {
+        appendLog({
+          kind: 'error',
+          at: Date.now(),
+          text: `classifier: ${e instanceof Error ? e.message : String(e)}`,
+        });
+      }
+    },
+    [appendLog],
+  );
+
+  // ---- toggle ----
   const onToggle = useCallback(async () => {
     const capture = captureRef.current;
     if (!capture) return;
@@ -285,6 +424,8 @@ export function App() {
       });
       return;
     }
+    classifierFiredRef.current = false;
+    setClassifier(null);
     try {
       await capture.start();
     } catch (e) {
@@ -293,11 +434,16 @@ export function App() {
     }
   }, [activeThread, appendLog]);
 
+  // ---- thread selection ----
   const onSelectThread = useCallback(
     async (id: string) => {
       try {
-        // Stop any in-flight session before swapping context.
         if (captureRef.current?.isActive) await captureRef.current.stop();
+        // If the user is overriding the schedule, remember it for the rest
+        // of the scheduled window so polling doesn't yank them back.
+        if (scheduleNow && id !== scheduleNow.threadId) {
+          overrideUntilMsRef.current = scheduleNow.untilMs;
+        }
         const t = await getThread(id);
         if (t) setActiveThread(t);
       } catch (e) {
@@ -308,12 +454,14 @@ export function App() {
         });
       }
     },
-    [appendLog],
+    [appendLog, scheduleNow],
   );
 
   const refreshThreads = useCallback(async () => {
     try {
-      setThreads(await listThreads());
+      const list = await listThreads();
+      setThreads(list);
+      threadsRef.current = list;
     } catch (e) {
       appendLog({
         kind: 'error',
@@ -324,14 +472,33 @@ export function App() {
   }, [appendLog]);
 
   const onSaveEditor = useCallback(
-    async (form: { name: string; systemPrompt: string; context: string }) => {
+    async (form: {
+      name: string;
+      group: string;
+      systemPrompt: string;
+      context: string;
+      summary: string;
+      scheduleText: string;
+    }) => {
       const isNew = editorState.mode === 'create' || !activeThread;
       const id = isNew ? makeThreadId(form.name) : activeThread!.id;
+      const { entries: schedule, errors } = parseSchedule(form.scheduleText);
+      if (errors.length > 0) {
+        appendLog({
+          kind: 'error',
+          at: Date.now(),
+          text: `schedule parse: ${errors.join('; ')}`,
+        });
+        return;
+      }
       const next: Thread = {
         id,
         name: form.name,
+        group: form.group || undefined,
         systemPrompt: form.systemPrompt,
         context: form.context,
+        summary: form.summary || undefined,
+        schedule: schedule.length > 0 ? schedule : undefined,
         history: isNew ? [] : (activeThread?.history ?? []),
         updatedAt: new Date().toISOString(),
       };
@@ -359,8 +526,9 @@ export function App() {
       if (captureRef.current?.isActive) await captureRef.current.stop();
       await deleteThread(activeThread.id);
       setEditorState({ open: false, mode: 'create' });
-      const remaining = (await listThreads());
+      const remaining = await listThreads();
       setThreads(remaining);
+      threadsRef.current = remaining;
       if (remaining.length > 0) {
         const next = await getThread(remaining[0].id);
         setActiveThread(next);
@@ -376,11 +544,38 @@ export function App() {
     }
   }, [activeThread, appendLog]);
 
+  // ---- classifier banner actions ----
+  const onClassifierSwitch = useCallback(async () => {
+    if (classifier?.kind !== 'match') return;
+    const id = classifier.threadId;
+    setClassifier(null);
+    await onSelectThread(id);
+  }, [classifier, onSelectThread]);
+
+  const onClassifierCreate = useCallback(
+    (suggestedName: string) => {
+      setClassifier(null);
+      setEditorState({ open: true, mode: 'create', prefill: { name: suggestedName } });
+    },
+    [],
+  );
+
   const onDismissCue = useCallback((id: number) => {
     setCues((prev) => prev.filter((c) => c.id !== id));
   }, []);
 
   const onClearCues = useCallback(() => setCues([]), []);
+
+  const knownGroups = Array.from(
+    new Set(threads.map((t) => t.group?.trim()).filter((g): g is string => !!g)),
+  ).sort();
+
+  const editorInitial =
+    editorState.mode === 'edit'
+      ? activeThread
+      : editorState.prefill
+        ? ({ name: editorState.prefill.name } as Partial<Thread>)
+        : null;
 
   return (
     <div className="app">
@@ -393,12 +588,32 @@ export function App() {
           <ThreadBar
             active={activeThread}
             threads={threads}
+            scheduledActiveId={scheduleNow?.threadId ?? null}
+            scheduledActiveUntil={scheduleNow?.untilLabel ?? null}
             onSelect={onSelectThread}
             onCreate={() => setEditorState({ open: true, mode: 'create' })}
             onEdit={() => setEditorState({ open: true, mode: 'edit' })}
           />
         }
       />
+
+      {classifier && classifier.kind === 'match' && (
+        <ClassifierBanner
+          kind="match"
+          threadName={threads.find((t) => t.id === classifier.threadId)?.name ?? '?'}
+          onAccept={onClassifierSwitch}
+          onDismiss={() => setClassifier(null)}
+        />
+      )}
+      {classifier && classifier.kind === 'new' && (
+        <ClassifierBanner
+          kind="new"
+          suggestedName={classifier.suggestedName}
+          onCreate={onClassifierCreate}
+          onDismiss={() => setClassifier(null)}
+        />
+      )}
+
       <div className="split">
         <div className="left-col">
           <div className="transcript-wrap">
@@ -413,7 +628,8 @@ export function App() {
 
       {editorState.open && (
         <ThreadEditor
-          initial={editorState.mode === 'edit' ? activeThread : null}
+          initial={editorInitial}
+          knownGroups={knownGroups}
           onSave={onSaveEditor}
           onCancel={() => setEditorState({ open: false, mode: 'create' })}
           onDelete={

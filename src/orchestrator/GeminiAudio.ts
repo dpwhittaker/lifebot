@@ -33,6 +33,11 @@ export type GeminiAudioOptions = {
   apiKey: string;
   model: string;
   systemInstruction?: string;
+  /**
+   * Brief directory of other thread names so the model can recognise when the
+   * user is referencing a different context, without leaking actual content.
+   */
+  threadDirectory?: string;
   /** Prior committed exchanges to seed the conversation history with. */
   initialHistory?: Array<{ heard: string; cue: string | null }>;
   /** How many user/model turn pairs of *committed* text history to keep. */
@@ -122,7 +127,11 @@ export class GeminiAudioOrchestrator {
     this.opts = opts;
     this.fetchImpl = opts.fetchImpl ?? fetch.bind(globalThis);
     this.maxHistoryTurns = opts.maxHistoryTurns ?? 24;
-    this.systemInstruction = opts.systemInstruction ?? DEFAULT_SYSTEM_INSTRUCTION;
+    const base = opts.systemInstruction ?? DEFAULT_SYSTEM_INSTRUCTION;
+    const dir = opts.threadDirectory?.trim();
+    this.systemInstruction = dir
+      ? `${base}\n\n--- other threads in the user's life (for cross-reference) ---\n${dir}\n\nWhen the speaker mentions one of these other threads in passing — by name, by character, by topic — feel free to surface a brief reference cue using the listed summary (e.g. "Your D&D character Brennan recently rescued villagers — could draw a parallel"). Treat these as flavor for the *current* conversation; the active thread is what the user is actually in. Do NOT propose switching threads in your cues; passing references stay passing.`
+      : base;
     const softCommitSec = opts.softCommitSec ?? 300; // 5 minutes
     this.softCommitBytes = softCommitSec * SAMPLE_RATE * 2; // 16-bit mono
 

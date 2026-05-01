@@ -1,8 +1,7 @@
 /**
  * A Thread is a recurring conversation about the same thing — a D&D campaign,
- * a class, a meeting series. Each thread has its own system prompt, its own
- * accumulated context, and its own history of cued exchanges across many
- * sessions.
+ * a class series, a meeting series, a project. Each thread has its own system
+ * prompt, optional background context, and persistent history across sessions.
  *
  * Threads live on the server (one JSON file per thread) so they survive page
  * reloads and can be reached from any client on the tailnet.
@@ -10,13 +9,45 @@
 export type Thread = {
   id: string;
   name: string;
+  /** Optional grouping label — e.g. "Work", "Church", "Personal". */
+  group?: string;
   systemPrompt: string;
   /** Optional free-text background context — paste rulebooks, syllabi, etc. */
   context?: string;
+  /**
+   * Compact one-paragraph summary of the thread's current state — character
+   * names, recent events, project status. This summary is shared into other
+   * threads' system prompts as "background awareness," so the model can
+   * produce passing-reference cues without leaking the full context.
+   */
+  summary?: string;
+  /** When this thread should auto-activate. Empty for manual-only threads. */
+  schedule?: ScheduleEntry[];
   /** Committed exchanges across all sessions in this thread, oldest first. */
   history: ThreadCommit[];
   updatedAt: string;
 };
+
+/**
+ * Schedule entries come in two shapes:
+ *   recurring: weekly on specified days at a fixed time-of-day window
+ *   one-shot:  a single specific date/time window (auto-archives after)
+ */
+export type ScheduleEntry =
+  | {
+      kind: 'recurring';
+      /** 0=Sun .. 6=Sat */
+      days: number[];
+      /** "HH:MM" 24h, local time */
+      start: string;
+      end: string;
+    }
+  | {
+      kind: 'one-shot';
+      /** ISO 8601 datetime, local interpretation. */
+      start: string;
+      end: string;
+    };
 
 export type ThreadCommit = {
   heard: string;
@@ -27,6 +58,10 @@ export type ThreadCommit = {
 export type ThreadSummary = {
   id: string;
   name: string;
+  group?: string;
+  schedule?: ScheduleEntry[];
+  /** Editable thread summary (character names, recent events, etc.). */
+  summary?: string;
   updatedAt: string | null;
   systemPromptPreview: string;
   commitCount: number;

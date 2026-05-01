@@ -204,6 +204,82 @@ button {
 .form-input:focus,
 .form-textarea:focus { border-color: var(--accent); outline: none; }
 .form-textarea { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 13px; line-height: 1.5; }
+.form-textarea-mono { font-family: ui-monospace, SFMono-Regular, monospace; }
+.form-errors {
+  color: var(--error);
+  font-size: 12px;
+  margin-top: var(--space-xs);
+  font-style: italic;
+  text-transform: none;
+  letter-spacing: normal;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.thread-group-heading {
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: var(--space-sm) var(--space-md) 4px;
+}
+.thread-active-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--good);
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.thread-active-until {
+  color: var(--good);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  margin-left: var(--space-xs);
+}
+
+/* Classifier banner */
+.classifier-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin: 0 var(--space-md) var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  font-size: 13px;
+}
+.classifier-banner-new {
+  background: rgba(95, 214, 138, 0.15);
+  border-color: var(--good);
+}
+.classifier-icon { font-size: 16px; }
+.classifier-text { color: var(--text); }
+.classifier-text strong { color: var(--accent); }
+.classifier-banner-new .classifier-text strong { color: var(--good); }
+.classifier-accept {
+  padding: 4px var(--space-md);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+}
+.classifier-banner-new .classifier-accept { border-color: var(--good); color: var(--good); }
+.classifier-dismiss {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+}
+.classifier-dismiss:hover { color: var(--text); }
 
 .modal-actions {
   display: flex;
