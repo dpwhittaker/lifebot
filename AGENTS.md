@@ -35,7 +35,16 @@ The whole pipeline runs in one browser tab. There is no server-side code. Mic ca
 
 **Why not the Live API:** Live's value is bidirectional streaming with server-side VAD. We deliberately do VAD on the device and ship discrete, complete utterances, so Live's streaming machinery doesn't help us — and Live forces audio output (which we'd throw away while still paying for the tokens). Plain `generateContent` with audio input is cheaper, simpler (no WebSocket lifecycle), and returns text directly.
 
-**Why "cheap" history:** `GeminiAudioOrchestrator` keeps a stateful `contents[]` array so the model has conversation context across turns. Past user turns are rewritten to just their `heard` text after the first response — the audio bytes drop out of history entirely. Cost stays roughly flat as the session lengthens; only the new turn pays the audio-token bill.
+**Why "cheap" history:** `GeminiAudioOrchestrator` keeps a stateful `contents[]` array so the model has conversation context across turns. Past user turns get rewritten to just their `heard` text once they're committed (see below) — the audio bytes drop out of history. Cost stays roughly flat as the session lengthens; only the active in-flight audio pays the audio-token bill.
+
+**Why audio buffers across turns:** A single VAD-detected utterance might not be cue-worthy on its own, but together with the next 30 seconds of conversation it might be. So the orchestrator carries unflushed audio between requests:
+
+- Each `sendTurn(pcm)` appends to a "since last cue" buffer.
+- Each request sends the *whole* buffer (not just the new segment), so the model can resolve far-field speech / partial words / cross-talk that a single segment couldn't.
+- When a response includes a cue, the in-flight slice is "committed": replaced by its `heard` text in `history[]`, audio bytes dropped. Frames added to the buffer *while* the request was in flight stay queued for the next round.
+- When responses keep coming back `null`, the buffer keeps growing. To bound cost, after `softCommitSec` (default 5 minutes) we soft-commit using the latest `heard` and reset.
+
+This costs more tokens per session than no-buffering — each utterance gets re-sent until a cue commits — but trades that for cue *quality* (Gemini gets more context). For our cue-monitoring use case where cues should be rare relative to chatter, the tradeoff is worth it.
 
 ## Repo layout
 
@@ -118,7 +127,9 @@ The logs dir is intentionally outside `.serve/` — that dir is the build output
 - **Don't add server-side logic to `.serve/`.** That dir is wiped on every build. The log endpoint lives in the proxy intentionally.
 - **Don't bypass the proxy** to serve the PWA on a different port. Add routes to its `ROUTES` table instead. The proxy owns the `:443` Let's Encrypt cert and the request fan-out.
 - **Don't switch back to the Live API.** It was the wrong tool for what we're doing — we VAD locally and send discrete utterances, so streaming isn't useful, and Live forces audio output we'd throw away while still paying for the tokens. Plain `generateContent` with audio input is cheaper and simpler. If we ever want bidirectional spoken interaction (model talks back), reconsider — but for passive monitoring, REST wins.
-- **Don't keep audio in the conversation history.** `GeminiAudioOrchestrator` deliberately rewrites past user turns to text after each response — keeping all that base64 audio in `contents[]` would balloon costs over a long session. Past turns become "user said X" so the model still has context.
+- **Don't keep audio in the conversation history.** `GeminiAudioOrchestrator` deliberately rewrites past user turns to text once they commit (cue arrives). Keeping all that base64 audio in `contents[]` would balloon costs over a long session. Past turns become "user said X" so the model still has context.
+- **Don't send raw `audio/pcm`.** `generateContent` only accepts container formats (`audio/wav`, `audio/mp3`, `audio/webm`). Raw PCM mime is a Live-API-only thing. Our `pcm16ToWav` wraps the PCM in a 44-byte header before base64. If we ever start hallucinated transcripts again, this is the first thing to check.
+- **Don't compress audio yet.** WAV is fine for sub-5-minute buffers and the cost is per audio second, not per byte. If real sessions show buffers regularly hitting the soft-commit cap, switch to Opus in WebM (`MediaRecorder` is browser-native; Gemini accepts it). MP3 needs a JS encoder dep — only worth it if Opus has some specific issue.
 
 ## Quick references
 
@@ -128,5 +139,6 @@ The logs dir is intentionally outside `.serve/` — that dir is the build output
 | Change cue prompt | `src/orchestrator/GeminiAudio.ts` (`DEFAULT_SYSTEM_INSTRUCTION`) |
 | Change UI / theme | `src/styles.css` (CSS variables) and the four pane components |
 | Change history retention | `GeminiAudioOptions.maxHistoryTurns` |
+| Tune merge / soft-commit timing | `LiveAudioCapture` (`MERGE_THRESHOLDS`, `HARD_CAP_MS`); `GeminiAudioOptions.softCommitSec` |
 | See what the device sent | `tail -f ~/projects/lifebot/logs/current.log` |
 | Revive Whisper / RN path | `~/projects/lifebot-rn` (full git history, `rn-final` tag) |

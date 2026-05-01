@@ -12,6 +12,11 @@ const API_KEY: string = (import.meta.env.VITE_GEMINI_API_KEY as string | undefin
 const MODEL: string =
   (import.meta.env.VITE_GEMINI_MODEL as string | undefined) ?? 'gemini-2.5-flash';
 
+function formatSeconds(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
 export function App() {
   const [chunks, setChunks] = useState<TranscriptChunk[]>([]);
   const [active, setActive] = useState(false);
@@ -60,16 +65,28 @@ export function App() {
             appendLog({
               kind: 'sent',
               at: event.at,
-              text: `→ Gemini (${(event.bytes / 1024).toFixed(1)} KB audio)`,
+              text: `→ Gemini (${formatSeconds(event.bufferMs)} of audio, ${(event.bytes / 1024).toFixed(1)} KB)`,
               meta: MODEL,
             });
             break;
-          case 'response':
+          case 'response': {
+            const tail = event.committed
+              ? ' · committed'
+              : ` · holding ${formatSeconds(event.bufferMsAfter)} buffered`;
             appendLog({
               kind: event.cue ? 'cue' : 'null',
               at: event.at,
               text: event.cue ?? '(no cue)',
-              meta: `${event.latencyMs}ms · heard "${event.heard.slice(0, 80)}"`,
+              meta: `${event.latencyMs}ms · heard "${event.heard.slice(0, 80)}"${tail}`,
+            });
+            break;
+          }
+          case 'soft_commit':
+            appendLog({
+              kind: 'null',
+              at: event.at,
+              text: `soft-commit (${event.reason})`,
+              meta: `flushed ${formatSeconds(event.bufferMs)} from buffer`,
             });
             break;
           case 'error':
@@ -115,14 +132,31 @@ export function App() {
 
     const capture = new LiveAudioCapture(orchestrator, {
       onVadActive: (a) => setVadActive(a),
-      onVadEvent: (kind, samples) => {
-        const text =
-          kind === 'speech_start'
-            ? 'VAD: speech start'
-            : kind === 'speech_end'
-              ? `VAD: speech end (${samples ? Math.round((samples / 16000) * 1000) : 0}ms audio)`
-              : 'VAD: misfire (too short to send)';
-        appendLog({ kind: kind === 'misfire' ? 'null' : 'sent', at: Date.now(), text });
+      onVadEvent: (kind, info) => {
+        let text = '';
+        let logKind: LogEntry['kind'] = 'sent';
+        switch (kind) {
+          case 'speech_start':
+            text = 'VAD: speech start';
+            break;
+          case 'speech_end': {
+            const ms = info?.samples ? Math.round((info.samples / 16000) * 1000) : 0;
+            text = `VAD: speech end (${ms}ms segment)`;
+            break;
+          }
+          case 'misfire':
+            text = 'VAD: misfire (too short)';
+            logKind = 'null';
+            break;
+          case 'merge':
+            text = `merge: continuing turn (buffer ${info?.bufferMs ?? 0}ms)`;
+            logKind = 'null';
+            break;
+          case 'flush':
+            text = `flush: ${info?.bufferMs ?? 0}ms turn (${info?.reason ?? 'idle'})`;
+            break;
+        }
+        appendLog({ kind: logKind, at: Date.now(), text });
       },
       onAudioSent: () => {
         setPendingCues((n) => n + 1);

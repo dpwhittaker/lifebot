@@ -106,7 +106,7 @@ Your `VITE_GEMINI_API_KEY` ends up inlined into the built JavaScript bundle and 
 ## Limitations
 
 - **Backgrounded tabs**: most mobile browsers pause microphone capture when the tab is backgrounded or the screen sleeps. The app requests a screen wake-lock when listening, but you'll still want the screen on.
-- **Cost**: each utterance is one Gemini Flash request — audio in (~3 seconds typical, a few hundred tokens), JSON out (a few dozen tokens). For active conversation expect a small fraction of a cent per utterance, in the low single-digit cents per active hour. Past audio is dropped from the conversation history (only the transcribed text is kept), so cost stays roughly flat as a session lengthens. Check current pricing at <https://ai.google.dev/pricing>.
+- **Cost**: each request is one Gemini Flash call — audio in, JSON out. The orchestrator carries un-cued audio across multiple requests so the model can re-evaluate with growing context (this trades extra audio tokens for better cue quality), and converts it to text once a cue arrives. Expect a few cents per active hour of conversation; check <https://ai.google.dev/pricing> for current numbers.
 
 ## License
 
