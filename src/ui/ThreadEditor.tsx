@@ -3,7 +3,9 @@ import type { Thread } from '../threads/types';
 import { formatSchedule, parseSchedule } from '../threads/schedule';
 import {
   ADHOC_GROUP_ID,
+  buildGroupTree,
   type Group,
+  type GroupNode,
   type GroupSummary,
   type Person,
   deletePerson as apiDeletePerson,
@@ -13,6 +15,19 @@ import {
   slugify,
 } from '../threads/groups';
 import { VoiceprintControl } from './VoiceprintControl';
+
+/** Flatten the group tree into options indented by depth. */
+function indentedGroupOptions(groups: GroupSummary[]): { id: string; label: string }[] {
+  const out: { id: string; label: string }[] = [];
+  const walk = (nodes: GroupNode[], depth: number) => {
+    for (const n of nodes) {
+      out.push({ id: n.id, label: `${'  '.repeat(depth)}${depth > 0 ? '↳ ' : ''}${n.name}` });
+      walk(n.children, depth + 1);
+    }
+  };
+  walk(buildGroupTree(groups), 0);
+  return out;
+}
 
 type SaveForm = {
   name: string;
@@ -53,6 +68,7 @@ export function ThreadEditor({
   const [group, setGroup] = useState<Group | null>(null);
   const [creatingGroup, setCreatingGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState('');
+  const [newGroupParent, setNewGroupParent] = useState<string>('');
   const [addingPerson, setAddingPerson] = useState(false);
   const [newPersonName, setNewPersonName] = useState('');
 
@@ -91,11 +107,17 @@ export function ThreadEditor({
     if (!trimmed) return;
     const id = slugify(trimmed);
     try {
-      const created = await saveGroup({ id, name: trimmed, people: [] });
+      const created = await saveGroup({
+        id,
+        name: trimmed,
+        parent: newGroupParent || undefined,
+        people: [],
+      });
       setGroup(created);
       setGroupId(id);
       setCreatingGroup(false);
       setNewGroupName('');
+      setNewGroupParent('');
       onGroupsChanged();
     } catch (e) {
       alert(`Couldn't create group: ${e instanceof Error ? e.message : String(e)}`);
@@ -175,44 +197,63 @@ export function ThreadEditor({
                 {!groups.some((g) => g.id === ADHOC_GROUP_ID) && (
                   <option value={ADHOC_GROUP_ID}>Ad-hoc (default)</option>
                 )}
-                {groups.map((g) => (
-                  <option key={g.id} value={g.id}>
-                    {g.name}
+                {indentedGroupOptions(groups).map((opt) => (
+                  <option key={opt.id} value={opt.id}>
+                    {opt.label}
                   </option>
                 ))}
                 <option value="__create__">+ Create new group…</option>
               </select>
             </div>
           ) : (
-            <div className="row-tight">
-              <input
-                type="text"
-                value={newGroupName}
-                onChange={(e) => setNewGroupName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') void handleCreateGroup();
-                  if (e.key === 'Escape') {
+            <div className="create-group-form">
+              <div className="row-tight">
+                <input
+                  type="text"
+                  value={newGroupName}
+                  onChange={(e) => setNewGroupName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') void handleCreateGroup();
+                    if (e.key === 'Escape') {
+                      setCreatingGroup(false);
+                      setNewGroupName('');
+                      setNewGroupParent('');
+                    }
+                  }}
+                  placeholder="New group name (e.g. BSA/AML Devs)"
+                  className="form-input"
+                  autoFocus
+                />
+                <button type="button" className="btn-primary btn-small" onClick={handleCreateGroup}>
+                  Create
+                </button>
+                <button
+                  type="button"
+                  className="btn-ghost-modal btn-small"
+                  onClick={() => {
                     setCreatingGroup(false);
                     setNewGroupName('');
-                  }
-                }}
-                placeholder="New group name (e.g. Work, D&D, Church)"
-                className="form-input"
-                autoFocus
-              />
-              <button type="button" className="btn-primary btn-small" onClick={handleCreateGroup}>
-                Create
-              </button>
-              <button
-                type="button"
-                className="btn-ghost-modal btn-small"
-                onClick={() => {
-                  setCreatingGroup(false);
-                  setNewGroupName('');
-                }}
-              >
-                Cancel
-              </button>
+                    setNewGroupParent('');
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+              <div className="row-tight">
+                <span className="form-sublabel">Parent (optional):</span>
+                <select
+                  value={newGroupParent}
+                  onChange={(e) => setNewGroupParent(e.target.value)}
+                  className="form-input"
+                >
+                  <option value="">— root —</option>
+                  {indentedGroupOptions(groups).map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
           )}
         </label>

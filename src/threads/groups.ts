@@ -19,6 +19,8 @@ export type Person = {
 export type Group = {
   id: string;
   name: string;
+  /** Group id of the parent in the hierarchy. Undefined for roots. */
+  parent?: string;
   people: Person[];
   updatedAt?: string;
 };
@@ -26,9 +28,56 @@ export type Group = {
 export type GroupSummary = {
   id: string;
   name: string;
+  parent?: string;
   peopleCount: number;
   updatedAt: string | null;
 };
+
+/** Subtree node. */
+export type GroupNode = {
+  id: string;
+  name: string;
+  parent?: string;
+  children: GroupNode[];
+};
+
+/** Build the forest of group nodes from a flat list. */
+export function buildGroupTree(groups: GroupSummary[]): GroupNode[] {
+  const byId = new Map<string, GroupNode>();
+  for (const g of groups) {
+    byId.set(g.id, { id: g.id, name: g.name, parent: g.parent, children: [] });
+  }
+  const roots: GroupNode[] = [];
+  for (const node of byId.values()) {
+    if (node.parent && byId.has(node.parent)) {
+      byId.get(node.parent)!.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+  // Sort each level alphabetically.
+  const sortRecursive = (nodes: GroupNode[]) => {
+    nodes.sort((a, b) => a.name.localeCompare(b.name));
+    for (const n of nodes) sortRecursive(n.children);
+  };
+  sortRecursive(roots);
+  return roots;
+}
+
+/** Return the ids of `rootId` and all its descendants. */
+export function descendantIds(groups: GroupSummary[], rootId: string): string[] {
+  const childrenOf: Record<string, string[]> = {};
+  for (const g of groups) {
+    if (g.parent) (childrenOf[g.parent] ??= []).push(g.id);
+  }
+  const out: string[] = [];
+  const walk = (id: string) => {
+    out.push(id);
+    for (const c of childrenOf[id] ?? []) walk(c);
+  };
+  walk(rootId);
+  return out;
+}
 
 export const ADHOC_GROUP_ID = 'ad-hoc';
 export const ADHOC_GROUP_NAME = 'Ad-hoc';

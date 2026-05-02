@@ -44,6 +44,13 @@ export type AudioResponse = {
    *   { "New Person 1": "Bob" }
    */
   speakerNames?: Record<string, string>;
+  /**
+   * Optional group classification hint. Set when the active thread is in a
+   * broad group (Ad-hoc, or a high-level group with sub-groups) and Gemini
+   * narrows down which sub-group the conversation actually belongs to based
+   * on jargon, project names, attendees.
+   */
+  groupHint?: { groupId: string; confidence: 'low' | 'medium' | 'high' };
 };
 
 export type SpeakerSegment = {
@@ -60,6 +67,7 @@ export type CommitEntry = {
   audioPcm?: Uint8Array;
   segments?: SpeakerSegment[];
   speakerNames?: Record<string, string>;
+  groupHint?: { groupId: string; confidence: 'low' | 'medium' | 'high' };
 };
 
 export type GeminiAudioOptions = {
@@ -77,6 +85,13 @@ export type GeminiAudioOptions = {
    * prefix of every request, so cost amortises after the first call.
    */
   voiceReferences?: VoiceReference[];
+  /**
+   * If present, the model is asked to narrow the conversation down to one of
+   * these candidate groups (id + name + people preview) and surface its guess
+   * in the response's groupHint field. Used when the active thread is in a
+   * broad / Ad-hoc group and we want the system to figure out the real one.
+   */
+  groupCatalog?: { id: string; label: string }[];
   /** Prior committed exchanges to seed the conversation history with. */
   initialHistory?: Array<{ heard: string; cue: string | null }>;
   /** How many user/model turn pairs of *committed* text history to keep. */
@@ -226,6 +241,12 @@ export class GeminiAudioOrchestrator {
       const names = this.opts.voiceReferences.map((v) => v.name).join(', ');
       parts.push(
         `--- known voice references ---\nVoice reference clips for the following people are included at the start of this conversation: ${names}. When you hear a voice that matches one of them, use that person's name in "heard" and "segments". For voices that don't match any reference, use "New Person 1", "New Person 2", etc. — keep the same label for the same voice across the whole conversation.`,
+      );
+    }
+    if (this.opts.groupCatalog && this.opts.groupCatalog.length > 0) {
+      const list = this.opts.groupCatalog.map((g) => `  - id="${g.id}"  ${g.label}`).join('\n');
+      parts.push(
+        `--- group classification ---\nThe active thread isn't tied to a specific sub-group yet. Help narrow it down. Listen for project names, jargon, attendee names, organisational cues; pick the most likely group from this list and emit it as groupHint:\n${list}\n\nReturn groupHint with confidence "low" (just a hunch), "medium" (probable), or "high" (clear evidence). Only emit the field when you can make a meaningful guess; omit it otherwise.`,
       );
     }
     return parts.join('\n\n');
@@ -419,6 +440,7 @@ export class GeminiAudioOrchestrator {
       audioPcm,
       segments: parsed.segments,
       speakerNames: parsed.speakerNames,
+      groupHint: parsed.groupHint,
     });
   }
 
@@ -481,6 +503,16 @@ function parseResponse(raw: string): AudioResponse {
                 ([k, v]) => typeof k === 'string' && typeof v === 'string' && k && v,
               ),
             )
+          : undefined,
+      groupHint:
+        parsed.groupHint &&
+        typeof parsed.groupHint === 'object' &&
+        typeof parsed.groupHint.groupId === 'string' &&
+        ['low', 'medium', 'high'].includes(parsed.groupHint.confidence as string)
+          ? {
+              groupId: parsed.groupHint.groupId,
+              confidence: parsed.groupHint.confidence as 'low' | 'medium' | 'high',
+            }
           : undefined,
     };
   } catch {

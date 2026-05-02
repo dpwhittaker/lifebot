@@ -317,6 +317,8 @@ button {
   align-items: center;
 }
 .row-tight .form-input { flex: 1; }
+.create-group-form { display: flex; flex-direction: column; gap: var(--space-sm); }
+.form-sublabel { color: var(--text-muted); font-size: 12px; white-space: nowrap; }
 
 /* People list inside the thread editor */
 .people-list {

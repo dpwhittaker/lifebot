@@ -24,6 +24,7 @@ import {
 import { findActiveSchedule, parseSchedule } from './threads/schedule';
 import {
   ADHOC_GROUP_ID,
+  descendantIds,
   ensureAdhocGroup,
   fetchVoiceprintBytes,
   getGroup,
@@ -65,6 +66,22 @@ const SAMPLE_RATE = 16000;
 const BYTES_PER_SAMPLE = 2;
 const MIN_VOICEPRINT_MS = 2_000;
 
+/** Compact catalog of groups (with hierarchy hints) for the model to classify into. */
+function composeGroupCatalog(groups: GroupSummary[]): { id: string; label: string }[] {
+  const byId = new Map(groups.map((g) => [g.id, g]));
+  return groups
+    .filter((g) => g.id !== ADHOC_GROUP_ID)
+    .map((g) => {
+      const path: string[] = [g.name];
+      let cur = g.parent;
+      while (cur && byId.has(cur)) {
+        path.unshift(byId.get(cur)!.name);
+        cur = byId.get(cur)!.parent;
+      }
+      return { id: g.id, label: path.join(' › ') };
+    });
+}
+
 /** Slice a sub-segment out of 16-bit mono PCM by start/end seconds. */
 function extractPcmSegment(pcm: Uint8Array, startSec: number, endSec: number): Uint8Array {
   const start = Math.max(0, Math.floor(startSec * SAMPLE_RATE) * BYTES_PER_SAMPLE);
@@ -73,24 +90,35 @@ function extractPcmSegment(pcm: Uint8Array, startSec: number, endSec: number): U
   return pcm.slice(start, end);
 }
 
-/** Load the WAV bytes for every roster member who has a voiceprint on file. */
+/**
+ * Load the WAV bytes for every person in the thread's group AND all descendant
+ * groups. Cross-session learning: a meeting in any group inherits voiceprints
+ * from every sub-team below it. (A BSA/AML standup pulls only BSA/AML people;
+ * an FCU PI Planning pulls everyone in FCU's subtree.)
+ */
 async function loadVoiceReferences(
   thread: Thread | null,
-  group: Group | null,
+  groupSummaries: GroupSummary[],
 ): Promise<VoiceReference[]> {
-  if (!thread || !group) return [];
-  const rosterIds = thread.roster ?? [];
-  if (rosterIds.length === 0) return [];
-  const rosterPeople = group.people.filter(
-    (p) => rosterIds.includes(p.id) && p.hasVoiceprint,
-  );
+  if (!thread?.group) return [];
+  const ids = descendantIds(groupSummaries, thread.group);
   const out: VoiceReference[] = [];
-  for (const p of rosterPeople) {
+  for (const gid of ids) {
+    let group: Group | null;
     try {
-      const bytes = await fetchVoiceprintBytes(group.id, p.id);
-      if (bytes) out.push({ name: p.name, wav: bytes });
+      group = await getGroup(gid);
     } catch {
-      // skip on fetch failure
+      continue;
+    }
+    if (!group) continue;
+    for (const p of group.people) {
+      if (!p.hasVoiceprint) continue;
+      try {
+        const bytes = await fetchVoiceprintBytes(gid, p.id);
+        if (bytes) out.push({ name: p.name, wav: bytes });
+      } catch {
+        // skip
+      }
     }
   }
   return out;
@@ -296,12 +324,18 @@ export function App() {
     classifierFiredRef.current = false;
 
     const directory = composeThreadDirectory(activeThread, threads);
+    // When the active thread is in the Ad-hoc group, give the model a catalog
+    // of real groups so it can suggest a better fit via groupHint.
+    const groupCatalog =
+      activeThread?.group === ADHOC_GROUP_ID
+        ? composeGroupCatalog(groups)
+        : undefined;
 
     // Eagerly kick off voiceprint loads for the thread's roster. The orchestrator
     // accepts them via setVoiceReferences once they arrive; in practice they're
     // loaded long before the user finishes their first sentence.
     void (async () => {
-      const refs = await loadVoiceReferences(activeThread, activeGroup);
+      const refs = await loadVoiceReferences(activeThread, groups);
       if (cancelled) return;
       if (refs.length > 0) {
         appendLog({
@@ -318,6 +352,7 @@ export function App() {
       model: MODEL,
       systemInstruction: composeSystemPrompt(activeThread),
       threadDirectory: directory,
+      groupCatalog,
       initialHistory: activeThread?.history ?? [],
       onTrace: (event) => {
         switch (event.type) {
@@ -425,6 +460,7 @@ export function App() {
           });
         });
         void processSpeakerDiscovery(entry);
+        void processGroupHint(entry);
       },
     });
     orchestratorRef.current = orchestrator;
@@ -598,12 +634,56 @@ export function App() {
           const fresh = await getGroup(group.id);
           if (fresh) {
             setActiveGroup(fresh);
-            const refs = await loadVoiceReferences(activeThreadRef.current, fresh);
+            const freshGroups = await listGroups();
+            setGroups(freshGroups);
+            const refs = await loadVoiceReferences(activeThreadRef.current, freshGroups);
             orchestratorRef.current?.setVoiceReferences(refs);
           }
         } catch {
           // non-fatal
         }
+      }
+    },
+    [appendLog],
+  );
+
+  // ---- group inference ----
+  const processGroupHint = useCallback(
+    async (entry: CommitEntry) => {
+      const hint = entry.groupHint;
+      const thread = activeThreadRef.current;
+      if (!hint || !thread) return;
+      // Only auto-switch from Ad-hoc, and only on high-confidence hints.
+      if (thread.group !== ADHOC_GROUP_ID) return;
+      if (hint.confidence !== 'high') {
+        appendLog({
+          kind: 'sent',
+          at: Date.now(),
+          text: `group hint: ${hint.groupId} (${hint.confidence}) — holding`,
+        });
+        return;
+      }
+      const newGroup = await getGroup(hint.groupId);
+      if (!newGroup) return;
+      try {
+        const updated: Thread = {
+          ...thread,
+          group: hint.groupId,
+          updatedAt: new Date().toISOString(),
+        };
+        await saveThread(updated);
+        appendLog({
+          kind: 'sent',
+          at: Date.now(),
+          text: `↳ thread group set to ${newGroup.name} (Gemini classified)`,
+        });
+        setActiveThread(updated);
+      } catch (e) {
+        appendLog({
+          kind: 'error',
+          at: Date.now(),
+          text: `group switch failed: ${e instanceof Error ? e.message : String(e)}`,
+        });
       }
     },
     [appendLog],
