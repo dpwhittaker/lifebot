@@ -33,6 +33,33 @@ export type VoiceReference = {
 export type AudioResponse = {
   heard: string;
   cue: string | null;
+  /**
+   * Per-speaker segments within the audio that was sent in this request.
+   * Timestamps are seconds from the start of the request's audio.
+   */
+  segments?: SpeakerSegment[];
+  /**
+   * Optional rename hints — if Gemini hears an unknown speaker addressed
+   * by name in conversation, it can map the auto-label to a real name.
+   *   { "New Person 1": "Bob" }
+   */
+  speakerNames?: Record<string, string>;
+};
+
+export type SpeakerSegment = {
+  speaker: string;
+  startSec: number;
+  endSec: number;
+};
+
+/** Surfaced on every commit (cue or soft-commit). */
+export type CommitEntry = {
+  heard: string;
+  cue: string | null;
+  /** Raw 16-bit mono 16kHz PCM bytes that were sent in this request. */
+  audioPcm?: Uint8Array;
+  segments?: SpeakerSegment[];
+  speakerNames?: Record<string, string>;
 };
 
 export type GeminiAudioOptions = {
@@ -64,7 +91,7 @@ export type GeminiAudioOptions = {
   onTrace?: (event: AudioOrchestratorTrace) => void;
   onResponse?: (response: AudioResponse) => void;
   /** Fires every time a turn commits (cue arrives or soft-commit triggers). */
-  onCommit?: (entry: { heard: string; cue: string | null }) => void;
+  onCommit?: (entry: CommitEntry) => void;
 };
 
 const SAMPLE_RATE = 16000;
@@ -74,7 +101,15 @@ const DEFAULT_SYSTEM_INSTRUCTION = `You are a passive session monitor for an in-
 Each request includes a stretch of audio that may contain multiple speakers, partial words, far-field talk, and silence. Listen carefully — far-field words you can resolve are often the most informative. The audio may also include parts you've already heard in earlier turns; that's expected.
 
 Respond with ONLY a JSON object of shape:
-{"heard": "<one-line transcript of all speech in the audio>", "cue": "<the actual answer or fact>" | null}
+{
+  "heard": "<one-line transcript of all speech, prefixed by speaker (Sarah: hi. Me: hey.)>",
+  "cue":   "<the actual answer or fact>" | null,
+  "segments": [
+    {"speaker": "Sarah",        "startSec": 0.0, "endSec": 3.5},
+    {"speaker": "New Person 1", "startSec": 3.5, "endSec": 7.2}
+  ],
+  "speakerNames": { "New Person 1": "Bob" }   // optional rename hints
+}
 
 Rules for "cue":
 - A cue is for the LISTENER (someone watching the screen) — give them the *answer* or *fact*, not a description of what was asked. If a player asks "what's the AC of a beholder?" the cue is "Beholder AC: 18 (natural armor)", NOT "The speaker asked for the beholder's AC".
@@ -82,7 +117,16 @@ Rules for "cue":
 - Keep cues under 240 characters. Pure information, no narration.
 - Otherwise output null. Skip filler / opinions / chit-chat / ambient noise / questions you can't actually answer.
 
-Always include "heard" — a clean one-line transcript of all intelligible speech in the audio. Never output anything other than the JSON object.`;
+Rules for "segments":
+- One entry per contiguous span of single-speaker audio. Order by time.
+- Use the speaker's known name where possible. For unrecognised voices, use "New Person 1", "New Person 2", etc., consistently within the conversation. The user (device owner) is "Me".
+- Timestamps are seconds from the start of the audio in this request.
+
+Rules for "speakerNames":
+- Optional. If you hear an unknown speaker addressed by name in the conversation ("hey Bob, what do you think?") and you can map "New Person N" to a real name with reasonable confidence, include it.
+- Omit the field entirely if you have no rename to suggest.
+
+Always include "heard" and "segments". Never output anything other than the JSON object.`;
 
 type GeminiPart = { text: string } | { inlineData: { mimeType: string; data: string } };
 type GeminiTurn = { role: 'user' | 'model'; parts: GeminiPart[] };
@@ -181,7 +225,7 @@ export class GeminiAudioOrchestrator {
     if (this.opts.voiceReferences && this.opts.voiceReferences.length > 0) {
       const names = this.opts.voiceReferences.map((v) => v.name).join(', ');
       parts.push(
-        `--- speaker identification ---\nVoice reference clips for the following people are included at the start of this conversation: ${names}.\n\nIn your "heard" field, prefix each utterance with the speaker's name when you can identify them by voice (e.g. "Sarah: where did we leave off? Bob: the migration plan."). Use "Speaker A", "Speaker B" for unrecognised voices. The user (the device owner) is the one most often saying "I/me/my"; label them as "Me" if not in the named roster. Run speakers together on one line in heard text; punctuation only.`,
+        `--- known voice references ---\nVoice reference clips for the following people are included at the start of this conversation: ${names}. When you hear a voice that matches one of them, use that person's name in "heard" and "segments". For voices that don't match any reference, use "New Person 1", "New Person 2", etc. — keep the same label for the same voice across the whole conversation.`,
       );
     }
     return parts.join('\n\n');
@@ -300,20 +344,16 @@ export class GeminiAudioOrchestrator {
 
     let committed = false;
     if (parsed.cue) {
-      // Cue arrived — commit the in-flight slice as text. Frames added to
-      // pendingAudio while we were in flight stay queued for the next request.
-      this.commit(parsed.heard, rawText);
+      this.commit(parsed.heard, rawText, combined, parsed);
       committed = true;
     } else if (this.pendingBytes >= this.softCommitBytes) {
-      // No cue, but pending audio has grown too large — force commit using
-      // the latest heard text so cost doesn't keep growing.
       this.opts.onTrace?.({
         type: 'soft_commit',
         reason: `pending audio exceeded ${Math.round(this.softCommitBytes / 2 / SAMPLE_RATE)}s`,
         bufferMs: Math.round((this.pendingBytes / 2 / SAMPLE_RATE) * 1000),
         at: Date.now(),
       });
-      this.commit(parsed.heard, rawText);
+      this.commit(parsed.heard, rawText, combined, parsed);
       committed = true;
     }
     // else: keep all pending audio (including frames that were just sent),
@@ -362,23 +402,24 @@ export class GeminiAudioOrchestrator {
   }
 
   /** Drop the in-flight audio frames and push heard+raw response to history. */
-  private commit(heard: string, rawText: string): void {
+  private commit(
+    heard: string,
+    rawText: string,
+    audioPcm: Uint8Array,
+    parsed: AudioResponse,
+  ): void {
     this.dropInflight();
-    if (heard) {
-      this.history.push({ role: 'user', parts: [{ text: heard }] });
-      this.history.push({ role: 'model', parts: [{ text: rawText }] });
-      this.trimHistory();
-      // Surface the commit so the App can persist it to the active thread.
-      try {
-        const parsed = JSON.parse(rawText) as { heard?: string; cue?: string | null };
-        this.opts.onCommit?.({
-          heard,
-          cue: typeof parsed.cue === 'string' ? parsed.cue : null,
-        });
-      } catch {
-        this.opts.onCommit?.({ heard, cue: null });
-      }
-    }
+    if (!heard) return;
+    this.history.push({ role: 'user', parts: [{ text: heard }] });
+    this.history.push({ role: 'model', parts: [{ text: rawText }] });
+    this.trimHistory();
+    this.opts.onCommit?.({
+      heard,
+      cue: parsed.cue,
+      audioPcm,
+      segments: parsed.segments,
+      speakerNames: parsed.speakerNames,
+    });
   }
 
   /**
@@ -417,6 +458,30 @@ function parseResponse(raw: string): AudioResponse {
           : parsed.cue === null
             ? null
             : null,
+      segments: Array.isArray(parsed.segments)
+        ? parsed.segments
+            .filter(
+              (s): s is SpeakerSegment =>
+                !!s &&
+                typeof s.speaker === 'string' &&
+                typeof s.startSec === 'number' &&
+                typeof s.endSec === 'number' &&
+                s.endSec > s.startSec,
+            )
+            .map((s) => ({
+              speaker: s.speaker.trim(),
+              startSec: s.startSec,
+              endSec: s.endSec,
+            }))
+        : undefined,
+      speakerNames:
+        parsed.speakerNames && typeof parsed.speakerNames === 'object'
+          ? Object.fromEntries(
+              Object.entries(parsed.speakerNames).filter(
+                ([k, v]) => typeof k === 'string' && typeof v === 'string' && k && v,
+              ),
+            )
+          : undefined,
     };
   } catch {
     return { heard: stripped, cue: null };

@@ -18,6 +18,11 @@ dist-ssr
 # Local env (Gemini API key)
 .env
 
+# Runtime data written by the tailnet proxy alongside the project root
+/groups
+/threads
+/voiceprints
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

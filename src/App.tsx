@@ -28,10 +28,14 @@ import {
   fetchVoiceprintBytes,
   getGroup,
   listGroups,
+  savePerson,
+  slugify,
+  uploadVoiceprint,
   type Group,
   type GroupSummary,
 } from './threads/groups';
-import type { VoiceReference } from './orchestrator/GeminiAudio';
+import type { CommitEntry, VoiceReference } from './orchestrator/GeminiAudio';
+import { pcm16ToWav } from './util/wav';
 import type { Thread, ThreadSummary } from './threads/types';
 
 const API_KEY: string = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined) ?? '';
@@ -57,6 +61,18 @@ function composeSystemPrompt(thread: Thread | null): string | undefined {
 /** Compact directory of OTHER threads — for cross-thread awareness without bleed.
  *  Includes each thread's optional summary so the model can produce passing
  *  reference cues ("your D&D character Brennan would…") without switching. */
+const SAMPLE_RATE = 16000;
+const BYTES_PER_SAMPLE = 2;
+const MIN_VOICEPRINT_MS = 2_000;
+
+/** Slice a sub-segment out of 16-bit mono PCM by start/end seconds. */
+function extractPcmSegment(pcm: Uint8Array, startSec: number, endSec: number): Uint8Array {
+  const start = Math.max(0, Math.floor(startSec * SAMPLE_RATE) * BYTES_PER_SAMPLE);
+  const end = Math.min(pcm.length, Math.ceil(endSec * SAMPLE_RATE) * BYTES_PER_SAMPLE);
+  if (end <= start) return new Uint8Array(0);
+  return pcm.slice(start, end);
+}
+
 /** Load the WAV bytes for every roster member who has a voiceprint on file. */
 async function loadVoiceReferences(
   thread: Thread | null,
@@ -135,7 +151,13 @@ export function App() {
   const orchestratorRef = useRef<GeminiAudioOrchestrator | null>(null);
   const uploaderRef = useRef<LogUploader>(new LogUploader());
   const activeThreadIdRef = useRef<string | null>(null);
+  const activeThreadRef = useRef<Thread | null>(null);
+  const activeGroupRef = useRef<Group | null>(null);
   const threadsRef = useRef<ThreadSummary[]>([]);
+  /** Per-session map: speaker label as Gemini sees it → personId we created. */
+  const sessionSpeakersRef = useRef<
+    Map<string, { personId: string; bestMs: number }>
+  >(new Map());
 
   const appendLog = useCallback((entry: Omit<LogEntry, 'id'>) => {
     const full: LogEntry = { ...entry, id: ++logSeq.current };
@@ -210,7 +232,11 @@ export function App() {
   }, [threads]);
   useEffect(() => {
     activeThreadIdRef.current = activeThread?.id ?? null;
+    activeThreadRef.current = activeThread;
   }, [activeThread]);
+  useEffect(() => {
+    activeGroupRef.current = activeGroup;
+  }, [activeGroup]);
 
   // ---- schedule polling ----
   useEffect(() => {
@@ -391,13 +417,14 @@ export function App() {
       onCommit: (entry) => {
         const tid = activeThreadIdRef.current;
         if (!tid) return;
-        void appendCommit(tid, entry).catch((e) => {
+        void appendCommit(tid, { heard: entry.heard, cue: entry.cue }).catch((e) => {
           appendLog({
             kind: 'error',
             at: Date.now(),
             text: `thread commit failed: ${e instanceof Error ? e.message : String(e)}`,
           });
         });
+        void processSpeakerDiscovery(entry);
       },
     });
     orchestratorRef.current = orchestrator;
@@ -446,6 +473,141 @@ export function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeThread, activeGroup, appendLog]);
+
+  // ---- passive speaker discovery ----
+  const processSpeakerDiscovery = useCallback(
+    async (entry: CommitEntry) => {
+      const group = activeGroupRef.current;
+      const thread = activeThreadRef.current;
+      if (!group || !thread || !entry.audioPcm) return;
+      const segments = entry.segments ?? [];
+      if (segments.length === 0) return;
+
+      // Apply rename hints first — sometimes Gemini knows "New Person 1" is
+      // really "Bob" before we've materialised the placeholder. Map gets
+      // updated either way; the materialisation step picks up the new name.
+      const renames = entry.speakerNames ?? {};
+
+      // Speakers to ignore: already-known people in the group, plus "Me".
+      const knownNames = new Set(group.people.map((p) => p.name.toLowerCase()));
+      knownNames.add('me');
+
+      const labels = Array.from(new Set(segments.map((s) => s.speaker)));
+      let groupChanged = false;
+      let newRoster = thread.roster ? [...thread.roster] : [];
+
+      for (const label of labels) {
+        if (knownNames.has(label.toLowerCase())) continue;
+
+        // Resolve / materialise the person for this label.
+        let mapping = sessionSpeakersRef.current.get(label);
+        const renameTo = renames[label];
+        if (!mapping) {
+          // Use the rename hint as the person's name if Gemini already knows it.
+          const personName = renameTo ?? label;
+          const personId = slugify(personName);
+          try {
+            await savePerson(group.id, { id: personId, name: personName });
+            mapping = { personId, bestMs: 0 };
+            sessionSpeakersRef.current.set(label, mapping);
+            groupChanged = true;
+            if (!newRoster.includes(personId)) newRoster.push(personId);
+            appendLog({
+              kind: 'sent',
+              at: Date.now(),
+              text: `+ new speaker: ${personName}`,
+            });
+          } catch (e) {
+            appendLog({
+              kind: 'error',
+              at: Date.now(),
+              text: `failed to add ${personName}: ${e instanceof Error ? e.message : String(e)}`,
+            });
+            continue;
+          }
+        } else if (renameTo) {
+          // Already materialised, but Gemini just learned a real name for them.
+          const existing = group.people.find((p) => p.id === mapping!.personId);
+          if (existing && existing.name !== renameTo) {
+            try {
+              await savePerson(group.id, { ...existing, name: renameTo });
+              groupChanged = true;
+              appendLog({
+                kind: 'sent',
+                at: Date.now(),
+                text: `↳ renamed ${existing.name} → ${renameTo}`,
+              });
+            } catch {
+              // non-fatal
+            }
+          }
+        }
+
+        // Find this speaker's longest segment in this commit.
+        const segs = segments.filter((s) => s.speaker === label);
+        let longest = segs[0];
+        for (const s of segs) {
+          if (s.endSec - s.startSec > longest.endSec - longest.startSec) longest = s;
+        }
+        const ms = (longest.endSec - longest.startSec) * 1000;
+        if (ms < MIN_VOICEPRINT_MS) continue;
+        if (ms <= mapping.bestMs) continue;
+
+        const segPcm = extractPcmSegment(entry.audioPcm, longest.startSec, longest.endSec);
+        if (segPcm.byteLength === 0) continue;
+        const wav = pcm16ToWav(segPcm, SAMPLE_RATE, 1, 16);
+        try {
+          await uploadVoiceprint(group.id, mapping.personId, wav);
+          mapping.bestMs = ms;
+          groupChanged = true;
+          appendLog({
+            kind: 'sent',
+            at: Date.now(),
+            text: `🎙 voiceprint saved: ${segs[0].speaker} (${(ms / 1000).toFixed(1)}s)`,
+          });
+        } catch (e) {
+          appendLog({
+            kind: 'error',
+            at: Date.now(),
+            text: `voiceprint upload failed: ${e instanceof Error ? e.message : String(e)}`,
+          });
+        }
+      }
+
+      // Persist the expanded roster onto the thread (so next session picks
+      // up the new people automatically).
+      if (newRoster.length !== (thread.roster?.length ?? 0)) {
+        try {
+          const updated: Thread = {
+            ...thread,
+            roster: newRoster,
+            updatedAt: new Date().toISOString(),
+          };
+          await saveThread(updated);
+          activeThreadRef.current = updated;
+          setActiveThread(updated);
+        } catch {
+          // non-fatal
+        }
+      }
+
+      if (groupChanged) {
+        // Refresh the active group + push the new voiceprints into the live
+        // orchestrator so subsequent requests can identify these speakers.
+        try {
+          const fresh = await getGroup(group.id);
+          if (fresh) {
+            setActiveGroup(fresh);
+            const refs = await loadVoiceReferences(activeThreadRef.current, fresh);
+            orchestratorRef.current?.setVoiceReferences(refs);
+          }
+        } catch {
+          // non-fatal
+        }
+      }
+    },
+    [appendLog],
+  );
 
   // ---- classifier ----
   const runClassifier = useCallback(
@@ -532,6 +694,7 @@ export function App() {
     }
     classifierFiredRef.current = false;
     setClassifier(null);
+    sessionSpeakersRef.current.clear();
     try {
       await capture.start();
     } catch (e) {
