@@ -12,6 +12,7 @@ import {
   savePerson,
   slugify,
 } from '../threads/groups';
+import { VoiceprintControl } from './VoiceprintControl';
 
 type SaveForm = {
   name: string;
@@ -224,23 +225,33 @@ export function ThreadEditor({
             )}
             {group?.people.map((p) => (
               <div key={p.id} className="person-row">
-                <label className="person-check">
-                  <input
-                    type="checkbox"
-                    checked={roster.includes(p.id)}
-                    onChange={() => togglePerson(p.id)}
-                  />
-                  <span className="person-name">{p.name}</span>
-                  {p.role && <span className="person-role">{p.role}</span>}
-                </label>
-                <button
-                  type="button"
-                  className="person-remove"
-                  onClick={() => handleRemovePerson(p.id)}
-                  title="Remove from group"
-                >
-                  ×
-                </button>
+                <div className="person-main">
+                  <label className="person-check">
+                    <input
+                      type="checkbox"
+                      checked={roster.includes(p.id)}
+                      onChange={() => togglePerson(p.id)}
+                    />
+                    <span className="person-name">{p.name}</span>
+                    {p.role && <span className="person-role">{p.role}</span>}
+                  </label>
+                  <button
+                    type="button"
+                    className="person-remove"
+                    onClick={() => handleRemovePerson(p.id)}
+                    title="Remove from group"
+                  >
+                    ×
+                  </button>
+                </div>
+                <VoiceprintControl
+                  groupId={groupId}
+                  person={p}
+                  onChange={async () => {
+                    const fresh = await getGroup(groupId);
+                    if (fresh) setGroup(fresh);
+                  }}
+                />
               </div>
             ))}
             {addingPerson ? (

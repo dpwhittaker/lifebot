@@ -338,9 +338,59 @@ button {
 }
 .person-row {
   display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-bottom: var(--space-xs);
+  border-bottom: 1px solid var(--panel-edge);
+}
+.person-row:last-child { border-bottom: none; }
+.person-main {
+  display: flex;
   align-items: center;
   gap: var(--space-sm);
 }
+
+/* Voiceprint controls */
+.voiceprint-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding-left: 28px; /* align under the person name (past checkbox) */
+  font-size: 12px;
+}
+.voiceprint-row.recording {
+  background: rgba(239, 98, 98, 0.08);
+  border-radius: var(--radius-sm);
+  padding: 4px var(--space-sm);
+}
+.vp-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+.vp-dot-have { background: var(--good); }
+.vp-dot-active { background: var(--error); animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.vp-elapsed {
+  color: var(--error);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  font-weight: 600;
+}
+.vp-action {
+  padding: 2px var(--space-sm);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+.vp-action:hover:not(:disabled) { background: var(--accent-soft); }
+.vp-action:disabled { opacity: 0.5; cursor: not-allowed; }
+.vp-record { color: var(--accent); }
+.vp-stop { color: var(--error); border: 1px solid var(--error); }
+.vp-cancel { color: var(--text-muted); }
 .person-check {
   flex: 1;
   display: flex;

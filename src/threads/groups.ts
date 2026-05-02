@@ -12,8 +12,8 @@ export type Person = {
   id: string;
   name: string;
   role?: string;
-  /** Phase 2: relative URL to a voiceprint .wav, if recorded. */
-  voiceprintPath?: string;
+  /** Set true once a voiceprint .wav has been uploaded for this person. */
+  hasVoiceprint?: boolean;
 };
 
 export type Group = {
@@ -90,6 +90,38 @@ export async function deletePerson(groupId: string, personId: string): Promise<v
     { method: 'DELETE' },
   );
   if (!res.ok && res.status !== 204) throw new Error(`deletePerson: HTTP ${res.status}`);
+}
+
+export function voiceprintUrl(groupId: string, personId: string): string {
+  return `${BASE}/${encodeURIComponent(groupId)}/people/${encodeURIComponent(personId)}/voiceprint`;
+}
+
+export async function uploadVoiceprint(
+  groupId: string,
+  personId: string,
+  wav: Uint8Array,
+): Promise<void> {
+  const res = await fetch(voiceprintUrl(groupId, personId), {
+    method: 'PUT',
+    headers: { 'content-type': 'audio/wav' },
+    body: new Blob([wav as BlobPart], { type: 'audio/wav' }),
+  });
+  if (!res.ok) throw new Error(`uploadVoiceprint: HTTP ${res.status}`);
+}
+
+export async function deleteVoiceprint(groupId: string, personId: string): Promise<void> {
+  const res = await fetch(voiceprintUrl(groupId, personId), { method: 'DELETE' });
+  if (!res.ok && res.status !== 204) throw new Error(`deleteVoiceprint: HTTP ${res.status}`);
+}
+
+export async function fetchVoiceprintBytes(
+  groupId: string,
+  personId: string,
+): Promise<Uint8Array | null> {
+  const res = await fetch(voiceprintUrl(groupId, personId));
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`fetchVoiceprint: HTTP ${res.status}`);
+  return new Uint8Array(await res.arrayBuffer());
 }
 
 /** Ensure the Ad-hoc default group exists; idempotent. */

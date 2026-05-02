@@ -12,8 +12,10 @@ import { ThreadEditor } from './ui/ThreadEditor';
 import { ClassifierBanner } from './ui/ClassifierBanner';
 import { LogUploader } from './util/LogUploader';
 import {
+  ADHOC_THREAD_ID,
   appendCommit,
   deleteThread,
+  ensureAdhocThread,
   getThread,
   listThreads,
   makeThreadId,
@@ -23,11 +25,13 @@ import { findActiveSchedule, parseSchedule } from './threads/schedule';
 import {
   ADHOC_GROUP_ID,
   ensureAdhocGroup,
+  fetchVoiceprintBytes,
   getGroup,
   listGroups,
   type Group,
   type GroupSummary,
 } from './threads/groups';
+import type { VoiceReference } from './orchestrator/GeminiAudio';
 import type { Thread, ThreadSummary } from './threads/types';
 
 const API_KEY: string = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined) ?? '';
@@ -53,6 +57,29 @@ function composeSystemPrompt(thread: Thread | null): string | undefined {
 /** Compact directory of OTHER threads — for cross-thread awareness without bleed.
  *  Includes each thread's optional summary so the model can produce passing
  *  reference cues ("your D&D character Brennan would…") without switching. */
+/** Load the WAV bytes for every roster member who has a voiceprint on file. */
+async function loadVoiceReferences(
+  thread: Thread | null,
+  group: Group | null,
+): Promise<VoiceReference[]> {
+  if (!thread || !group) return [];
+  const rosterIds = thread.roster ?? [];
+  if (rosterIds.length === 0) return [];
+  const rosterPeople = group.people.filter(
+    (p) => rosterIds.includes(p.id) && p.hasVoiceprint,
+  );
+  const out: VoiceReference[] = [];
+  for (const p of rosterPeople) {
+    try {
+      const bytes = await fetchVoiceprintBytes(group.id, p.id);
+      if (bytes) out.push({ name: p.name, wav: bytes });
+    } catch {
+      // skip on fetch failure
+    }
+  }
+  return out;
+}
+
 function composeThreadDirectory(
   active: Thread | null,
   all: ThreadSummary[],
@@ -123,23 +150,30 @@ export function App() {
     return () => uploader.stop();
   }, []);
 
-  // ---- initial load: groups + threads, ensure Ad-hoc group exists ----
+  // ---- initial load: ensure Ad-hoc group + thread, then load all ----
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
         await ensureAdhocGroup();
+        await ensureAdhocThread();
         const [groupList, threadList] = await Promise.all([listGroups(), listThreads()]);
         if (cancelled) return;
         setGroups(groupList);
         setThreads(threadList);
         threadsRef.current = threadList;
-        if (threadList.length > 0) {
-          const scheduled = findActiveSchedule(threadList);
-          const pickId = scheduled ? scheduled.threadId : threadList[0].id;
-          const t = await getThread(pickId);
-          if (!cancelled && t) setActiveThread(t);
+        // Pick: schedule-matching thread > most recently used (excluding Ad-hoc
+        // unless it's the only option) > Ad-hoc.
+        const scheduled = findActiveSchedule(threadList);
+        let pickId: string;
+        if (scheduled) {
+          pickId = scheduled.threadId;
+        } else {
+          const nonAdhoc = threadList.filter((t) => t.id !== ADHOC_THREAD_ID);
+          pickId = nonAdhoc.length > 0 ? nonAdhoc[0].id : ADHOC_THREAD_ID;
         }
+        const t = await getThread(pickId);
+        if (!cancelled && t) setActiveThread(t);
       } catch (e) {
         appendLog({
           kind: 'error',
@@ -229,12 +263,29 @@ export function App() {
       return;
     }
 
+    let cancelled = false;
     setChunks([]);
     setCues([]);
     setClassifier(null);
     classifierFiredRef.current = false;
 
     const directory = composeThreadDirectory(activeThread, threads);
+
+    // Eagerly kick off voiceprint loads for the thread's roster. The orchestrator
+    // accepts them via setVoiceReferences once they arrive; in practice they're
+    // loaded long before the user finishes their first sentence.
+    void (async () => {
+      const refs = await loadVoiceReferences(activeThread, activeGroup);
+      if (cancelled) return;
+      if (refs.length > 0) {
+        appendLog({
+          kind: 'sent',
+          at: Date.now(),
+          text: `voiceprints loaded: ${refs.map((r) => r.name).join(', ')}`,
+        });
+      }
+      orchestratorRef.current?.setVoiceReferences(refs);
+    })();
 
     const orchestrator = new GeminiAudioOrchestrator({
       apiKey: API_KEY,
@@ -388,12 +439,13 @@ export function App() {
     captureRef.current = capture;
 
     return () => {
+      cancelled = true;
       void captureRef.current?.release();
       captureRef.current = null;
       orchestratorRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeThread, appendLog]);
+  }, [activeThread, activeGroup, appendLog]);
 
   // ---- classifier ----
   const runClassifier = useCallback(
@@ -407,14 +459,32 @@ export function App() {
           heard,
         );
         if (result.kind === 'match') {
-          // Only show banner if the match is a *different* thread AND we're
-          // confident. Lower-confidence matches are likely passing references.
           appendLog({
             kind: 'sent',
             at: Date.now(),
             text: `classifier: match → ${result.threadId} (${result.confidence})`,
           });
           if (result.threadId === activeThreadIdRef.current) return;
+
+          // If the user is on the Ad-hoc default (didn't pick anything), let
+          // the classifier silently route to the matched thread — that's the
+          // "gemini picks for me" behaviour. medium+ confidence is enough.
+          const isAdhoc = activeThreadIdRef.current === ADHOC_THREAD_ID;
+          if (isAdhoc && result.confidence !== 'low') {
+            const t = await getThread(result.threadId);
+            if (t) {
+              appendLog({
+                kind: 'sent',
+                at: Date.now(),
+                text: `auto-routed Ad-hoc → ${t.name}`,
+              });
+              setActiveThread(t);
+            }
+            return;
+          }
+
+          // The user explicitly picked the current thread; only show a switch
+          // banner on high confidence and let them decide.
           if (result.confidence !== 'high') return;
           setClassifier(result);
         } else if (result.kind === 'new') {
@@ -444,13 +514,21 @@ export function App() {
       await capture.stop();
       return;
     }
+    // If somehow no thread is active (e.g. all threads deleted), recover by
+    // re-creating Ad-hoc and selecting it. Should be unreachable in practice.
     if (!activeThread) {
-      appendLog({
-        kind: 'error',
-        at: Date.now(),
-        text: 'pick or create a thread before listening',
-      });
-      return;
+      try {
+        const adhoc = await ensureAdhocThread();
+        setActiveThread(adhoc);
+        return; // re-render will rebuild orchestrator; user can tap again
+      } catch (e) {
+        appendLog({
+          kind: 'error',
+          at: Date.now(),
+          text: `couldn't ensure default thread: ${e instanceof Error ? e.message : String(e)}`,
+        });
+        return;
+      }
     }
     classifierFiredRef.current = false;
     setClassifier(null);

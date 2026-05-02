@@ -24,6 +24,12 @@ export type GeminiUsage = {
   totalTokens: number;
 };
 
+/** A reference clip for one person, used to teach the model their voice. */
+export type VoiceReference = {
+  name: string;
+  wav: Uint8Array;
+};
+
 export type AudioResponse = {
   heard: string;
   cue: string | null;
@@ -38,6 +44,12 @@ export type GeminiAudioOptions = {
    * user is referencing a different context, without leaking actual content.
    */
   threadDirectory?: string;
+  /**
+   * Voice reference clips for the people in this thread's roster. The model
+   * uses them to identify speakers in transcripts. They form the cacheable
+   * prefix of every request, so cost amortises after the first call.
+   */
+  voiceReferences?: VoiceReference[];
   /** Prior committed exchanges to seed the conversation history with. */
   initialHistory?: Array<{ heard: string; cue: string | null }>;
   /** How many user/model turn pairs of *committed* text history to keep. */
@@ -104,7 +116,8 @@ export class GeminiAudioOrchestrator {
   private readonly fetchImpl: typeof fetch;
   private readonly maxHistoryTurns: number;
   private readonly softCommitBytes: number;
-  private readonly systemInstruction: string;
+  /** Recomputed when voice references change. */
+  private systemInstruction: string;
 
   /** Committed text-only turns (past cued exchanges). */
   private history: GeminiTurn[] = [];
@@ -127,11 +140,7 @@ export class GeminiAudioOrchestrator {
     this.opts = opts;
     this.fetchImpl = opts.fetchImpl ?? fetch.bind(globalThis);
     this.maxHistoryTurns = opts.maxHistoryTurns ?? 24;
-    const base = opts.systemInstruction ?? DEFAULT_SYSTEM_INSTRUCTION;
-    const dir = opts.threadDirectory?.trim();
-    this.systemInstruction = dir
-      ? `${base}\n\n--- other threads in the user's life (for cross-reference) ---\n${dir}\n\nWhen the speaker mentions one of these other threads in passing — by name, by character, by topic — feel free to surface a brief reference cue using the listed summary (e.g. "Your D&D character Brennan recently rescued villagers — could draw a parallel"). Treat these as flavor for the *current* conversation; the active thread is what the user is actually in. Do NOT propose switching threads in your cues; passing references stay passing.`
-      : base;
+    this.systemInstruction = this.buildSystemInstruction();
     const softCommitSec = opts.softCommitSec ?? 300; // 5 minutes
     this.softCommitBytes = softCommitSec * SAMPLE_RATE * 2; // 16-bit mono
 
@@ -152,6 +161,30 @@ export class GeminiAudioOrchestrator {
     this.pendingAudio = [];
     this.pendingBytes = 0;
     this.dirty = false;
+  }
+
+  /** Update the voice reference clips. Takes effect on the next request. */
+  setVoiceReferences(refs: VoiceReference[]): void {
+    this.opts.voiceReferences = refs;
+    this.systemInstruction = this.buildSystemInstruction();
+  }
+
+  private buildSystemInstruction(): string {
+    const base = this.opts.systemInstruction ?? DEFAULT_SYSTEM_INSTRUCTION;
+    const parts: string[] = [base];
+    const dir = this.opts.threadDirectory?.trim();
+    if (dir) {
+      parts.push(
+        `--- other threads in the user's life (for cross-reference) ---\n${dir}\n\nWhen the speaker mentions one of these other threads in passing — by name, by character, by topic — feel free to surface a brief reference cue using the listed summary (e.g. "Your D&D character Brennan recently rescued villagers — could draw a parallel"). Treat these as flavor for the *current* conversation; the active thread is what the user is actually in. Do NOT propose switching threads in your cues; passing references stay passing.`,
+      );
+    }
+    if (this.opts.voiceReferences && this.opts.voiceReferences.length > 0) {
+      const names = this.opts.voiceReferences.map((v) => v.name).join(', ');
+      parts.push(
+        `--- speaker identification ---\nVoice reference clips for the following people are included at the start of this conversation: ${names}.\n\nIn your "heard" field, prefix each utterance with the speaker's name when you can identify them by voice (e.g. "Sarah: where did we leave off? Bob: the migration plan."). Use "Speaker A", "Speaker B" for unrecognised voices. The user (the device owner) is the one most often saying "I/me/my"; label them as "Me" if not in the named roster. Run speakers together on one line in heard text; punctuation only.`,
+      );
+    }
+    return parts.join('\n\n');
   }
 
   sendTurn(pcm: Uint8Array): void {
@@ -206,7 +239,7 @@ export class GeminiAudioOrchestrator {
       inlineData: { mimeType: 'audio/wav', data: base64FromUint8(wav) },
     };
     const userTurn: GeminiTurn = { role: 'user', parts: [audioPart] };
-    const contents = [...this.history, userTurn];
+    const contents = [...this.referenceTurns(), ...this.history, userTurn];
 
     const url =
       `https://generativelanguage.googleapis.com/v1beta/models/${this.opts.model}:generateContent` +
@@ -297,6 +330,35 @@ export class GeminiAudioOrchestrator {
       at: Date.now(),
     });
     this.opts.onResponse?.(parsed);
+  }
+
+  /**
+   * Build the synthetic "voice references" turn pair that anchors the start
+   * of every request. Stable across the session, so it forms the cacheable
+   * prefix and only pays full token cost on the first request.
+   */
+  private referenceTurns(): GeminiTurn[] {
+    const refs = this.opts.voiceReferences;
+    if (!refs || refs.length === 0) return [];
+    const parts: GeminiPart[] = [
+      { text: 'Voice reference clips for speakers in this conversation:' },
+    ];
+    for (const r of refs) {
+      parts.push({ text: `${r.name}:` });
+      parts.push({
+        inlineData: {
+          mimeType: 'audio/wav',
+          data: base64FromUint8(r.wav),
+        },
+      });
+    }
+    parts.push({
+      text: 'Use these to identify speakers by name in the "heard" field of your replies.',
+    });
+    return [
+      { role: 'user', parts },
+      { role: 'model', parts: [{ text: 'Acknowledged. I will identify these speakers by voice.' }] },
+    ];
   }
 
   /** Drop the in-flight audio frames and push heard+raw response to history. */
