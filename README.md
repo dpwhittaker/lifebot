@@ -1,3 +1,7 @@
+---
+tags: [Assistant, WIP]
+---
+
 # LifeBot
 
 Passive session monitor. Listens to ambient conversation in the room — a tabletop game, a study group, a meeting — and surfaces brief contextual cues from a cloud LLM as the conversation unfolds.
