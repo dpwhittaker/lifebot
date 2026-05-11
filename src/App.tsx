@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { LiveAudioCapture } from './audio/LiveAudioCapture';
+import { WebAudioCapture } from './adapters/audio/WebAudioCapture';
 import { GeminiAudioOrchestrator } from './orchestrator/GeminiAudio';
 import { classifyConversation, type ClassifierResult } from './orchestrator/Classifier';
 import { Controls } from './ui/Controls';
-import { CuePane, type Cue } from './ui/CuePane';
+import { DomCueRenderer, type Cue } from './adapters/display/DomCueRenderer';
+import { G2HudPreview } from './adapters/display/G2HudPreview';
+import { G2HudRenderer } from './adapters/display/G2HudRenderer';
 import { OrchestratorLog, type LogEntry } from './ui/OrchestratorLog';
 import { TranscriptPane, type TranscriptChunk } from './ui/TranscriptPane';
 import { ThreadBar } from './ui/ThreadBar';
@@ -91,10 +93,12 @@ function extractPcmSegment(pcm: Uint8Array, startSec: number, endSec: number): U
 }
 
 /**
- * Load the WAV bytes for every person in the thread's group AND all descendant
- * groups. Cross-session learning: a meeting in any group inherits voiceprints
- * from every sub-team below it. (A BSA/AML standup pulls only BSA/AML people;
- * an FCU PI Planning pulls everyone in FCU's subtree.)
+ * Walk the active thread's group subtree (group + all descendants) and pull
+ * voiceprints + per-person notes. Cross-session learning: a meeting in any
+ * group inherits voiceprints from every sub-team below it. (A BSA/AML standup
+ * pulls only BSA/AML people; an FCU PI Planning pulls everyone in FCU's
+ * subtree.) Notes ride along on each VoiceReference so Gemini sees them in
+ * the priming turn alongside the voice clip.
  */
 async function loadVoiceReferences(
   thread: Thread | null,
@@ -115,7 +119,7 @@ async function loadVoiceReferences(
       if (!p.hasVoiceprint) continue;
       try {
         const bytes = await fetchVoiceprintBytes(gid, p.id);
-        if (bytes) out.push({ name: p.name, wav: bytes });
+        if (bytes) out.push({ name: p.name, notes: p.notes, wav: bytes });
       } catch {
         // skip
       }
@@ -175,8 +179,9 @@ export function App() {
   const [log, setLog] = useState<LogEntry[]>([]);
   const logSeq = useRef(0);
 
-  const captureRef = useRef<LiveAudioCapture | null>(null);
+  const captureRef = useRef<WebAudioCapture | null>(null);
   const orchestratorRef = useRef<GeminiAudioOrchestrator | null>(null);
+  const hudRendererRef = useRef<G2HudRenderer | null>(null);
   const uploaderRef = useRef<LogUploader>(new LogUploader());
   const activeThreadIdRef = useRef<string | null>(null);
   const activeThreadRef = useRef<Thread | null>(null);
@@ -199,6 +204,23 @@ export function App() {
     uploader.start();
     return () => uploader.stop();
   }, []);
+
+  // ---- G2 bridge renderer (no-op if no Even Hub bridge is present, e.g.
+  //      plain browser dev). Lives the whole app lifetime; receives every
+  //      committed cue's `short` form.
+  useEffect(() => {
+    const renderer = new G2HudRenderer();
+    hudRendererRef.current = renderer;
+    void renderer.init().then((ok) => {
+      if (ok) {
+        appendLog({ kind: 'sent', at: Date.now(), text: 'G2 bridge ready — HUD live' });
+      }
+    });
+    return () => {
+      renderer.destroy();
+      hudRendererRef.current = null;
+    };
+  }, [appendLog]);
 
   // ---- initial load: ensure Ad-hoc group + thread, then load all ----
   useEffect(() => {
@@ -440,19 +462,25 @@ export function App() {
               {
                 id: ++cueSeq.current,
                 text: response.cue!,
+                short: response.cueShort,
                 createdAt: Date.now(),
                 source: response.heard,
               },
               ...prev,
             ].slice(0, 50),
           );
+          hudRendererRef.current?.showCue(response.cueShort);
         }
         setPendingCues((n) => Math.max(0, n - 1));
       },
       onCommit: (entry) => {
         const tid = activeThreadIdRef.current;
         if (!tid) return;
-        void appendCommit(tid, { heard: entry.heard, cue: entry.cue }).catch((e) => {
+        void appendCommit(tid, {
+          heard: entry.heard,
+          cue: entry.cue,
+          cueShort: entry.cueShort,
+        }).catch((e) => {
           appendLog({
             kind: 'error',
             at: Date.now(),
@@ -465,7 +493,7 @@ export function App() {
     });
     orchestratorRef.current = orchestrator;
 
-    const capture = new LiveAudioCapture(orchestrator, {
+    const capture = new WebAudioCapture(orchestrator, {
       onVadActive: (a) => setVadActive(a),
       onVadEvent: (kind, info) => {
         let text = '';
@@ -970,16 +998,19 @@ export function App() {
         />
       )}
 
-      <div className="split">
-        <div className="left-col">
-          <div className="transcript-wrap">
-            <TranscriptPane chunks={chunks} active={active} vadActive={vadActive} />
-          </div>
-          <div className="log-wrap">
-            <OrchestratorLog entries={log} />
-          </div>
+      <div className="grid-2x2">
+        <div className="grid-cell">
+          <TranscriptPane chunks={chunks} active={active} vadActive={vadActive} />
         </div>
-        <CuePane cues={cues} onDismiss={onDismissCue} onClear={onClearCues} />
+        <div className="grid-cell">
+          <DomCueRenderer cues={cues} onDismiss={onDismissCue} onClear={onClearCues} />
+        </div>
+        <div className="grid-cell">
+          <OrchestratorLog entries={log} />
+        </div>
+        <div className="grid-cell">
+          <G2HudPreview cues={cues} />
+        </div>
       </div>
 
       {editorState.open && (

@@ -1,17 +1,6 @@
 import { MicVAD } from '@ricky0123/vad-web';
-import type { GeminiAudioOrchestrator } from '../orchestrator/GeminiAudio';
-
-export type LiveCaptureCallbacks = {
-  onVadActive?: (active: boolean) => void;
-  onAudioSent?: (bytes: number, at: number) => void;
-  onError?: (msg: string) => void;
-  onStatusChange?: (active: boolean) => void;
-  /** Per-event VAD trace for debugging. */
-  onVadEvent?: (
-    kind: 'speech_start' | 'speech_end' | 'misfire' | 'merge' | 'flush',
-    info?: { samples?: number; bufferMs?: number; reason?: string },
-  ) => void;
-};
+import type { GeminiAudioOrchestrator } from '../../orchestrator/GeminiAudio';
+import type { AudioCapture, AudioCaptureCallbacks } from './types';
 
 const SAMPLE_RATE = 16000;
 const HARD_CAP_MS = 30_000; // matches Gemini's per-request audio sweet spot
@@ -30,8 +19,9 @@ function mergeMsFor(bufferMs: number): number {
 }
 
 /**
- * Captures mic input via @ricky0123/vad-web (Silero in WASM) and ships each
- * detected utterance to the orchestrator as a single turn.
+ * Browser-mic implementation of AudioCapture. Captures via @ricky0123/vad-web
+ * (Silero in WASM) and ships each detected utterance to the orchestrator as a
+ * single turn.
  *
  * VAD acts as the *trigger* for what counts as a turn, but once a turn is
  * underway we accumulate **every** frame (including the quiet gaps between
@@ -45,7 +35,7 @@ function mergeMsFor(bufferMs: number): number {
  * pause budget; long monologues get cut sooner so we don't sit on a turn
  * forever.
  */
-export class LiveAudioCapture {
+export class WebAudioCapture implements AudioCapture {
   private vad?: MicVAD;
   private active = false;
   private wakeLock: WakeLockSentinel | null = null;
@@ -62,9 +52,9 @@ export class LiveAudioCapture {
   private mergeTimer: ReturnType<typeof setTimeout> | null = null;
 
   private readonly orchestrator: GeminiAudioOrchestrator;
-  private readonly cb: LiveCaptureCallbacks;
+  private readonly cb: AudioCaptureCallbacks;
 
-  constructor(orchestrator: GeminiAudioOrchestrator, cb: LiveCaptureCallbacks) {
+  constructor(orchestrator: GeminiAudioOrchestrator, cb: AudioCaptureCallbacks) {
     this.orchestrator = orchestrator;
     this.cb = cb;
   }

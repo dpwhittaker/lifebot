@@ -21,6 +21,17 @@ export default defineConfig({
   server: {
     host: true,
     port: 5174,
+    proxy: {
+      // Same-origin shim for the evenhub-simulator automation API. Run the
+      // simulator with `--automation-port 9898`; the HUD preview pane fetches
+      // `/sim-api/api/screenshot/glasses` to embed the live LVGL framebuffer.
+      // Going through Vite means no CORS handshake to worry about.
+      '/sim-api': {
+        target: 'http://127.0.0.1:9898',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/sim-api/, ''),
+      },
+    },
   },
   // Avoid bundling onnxruntime-web's wasm assets — we ship them straight from
   // public/ instead, so the runtime can fetch them at the same origin.

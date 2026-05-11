@@ -57,6 +57,9 @@ export type ScheduleEntry =
 export type ThreadCommit = {
   heard: string;
   cue: string | null;
+  /** HUD-form of the cue (≤80 chars). Optional on read for back-compat with
+   *  thread files written before Phase 2-prep. */
+  cueShort?: string | null;
   at: string;
 };
 

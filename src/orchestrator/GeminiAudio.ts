@@ -7,6 +7,7 @@ export type AudioOrchestratorTrace =
       type: 'response';
       heard: string;
       cue: string | null;
+      cueShort: string | null;
       latencyMs: number;
       committed: boolean;
       bufferMsAfter: number;
@@ -27,12 +28,22 @@ export type GeminiUsage = {
 /** A reference clip for one person, used to teach the model their voice. */
 export type VoiceReference = {
   name: string;
+  /** Free-form notes about the person — relationship to the user, role, what
+   *  they typically discuss. Surfaced alongside the voice clip so the model
+   *  can use context (topic, jargon) to disambiguate similar voices. */
+  notes?: string;
   wav: Uint8Array;
 };
 
 export type AudioResponse = {
   heard: string;
   cue: string | null;
+  /**
+   * Glanceable HUD form of the cue (≤80 chars, single line). Same answer,
+   * compressed for a heads-up display where the user reads in <2 seconds.
+   * Null when cue is null OR when no useful 80-char form exists for that cue.
+   */
+  cueShort: string | null;
   /**
    * Per-speaker segments within the audio that was sent in this request.
    * Timestamps are seconds from the start of the request's audio.
@@ -63,6 +74,7 @@ export type SpeakerSegment = {
 export type CommitEntry = {
   heard: string;
   cue: string | null;
+  cueShort: string | null;
   /** Raw 16-bit mono 16kHz PCM bytes that were sent in this request. */
   audioPcm?: Uint8Array;
   segments?: SpeakerSegment[];
@@ -93,7 +105,7 @@ export type GeminiAudioOptions = {
    */
   groupCatalog?: { id: string; label: string }[];
   /** Prior committed exchanges to seed the conversation history with. */
-  initialHistory?: Array<{ heard: string; cue: string | null }>;
+  initialHistory?: Array<{ heard: string; cue: string | null; cueShort?: string | null }>;
   /** How many user/model turn pairs of *committed* text history to keep. */
   maxHistoryTurns?: number;
   /**
@@ -117,8 +129,9 @@ Each request includes a stretch of audio that may contain multiple speakers, par
 
 Respond with ONLY a JSON object of shape:
 {
-  "heard": "<one-line transcript of all speech, prefixed by speaker (Sarah: hi. Me: hey.)>",
-  "cue":   "<the actual answer or fact>" | null,
+  "heard":    "<one-line transcript of all speech, prefixed by speaker (Sarah: hi. Me: hey.)>",
+  "cue":      "<the actual answer or fact, ≤240 chars>" | null,
+  "cueShort": "<same answer compressed for a heads-up display, ≤80 chars, single line>" | null,
   "segments": [
     {"speaker": "Sarah",        "startSec": 0.0, "endSec": 3.5},
     {"speaker": "New Person 1", "startSec": 3.5, "endSec": 7.2}
@@ -132,6 +145,14 @@ Rules for "cue":
 - Keep cues under 240 characters. Pure information, no narration.
 - Otherwise output null. Skip filler / opinions / chit-chat / ambient noise / questions you can't actually answer.
 
+Rules for "cueShort":
+- The same cue, compressed for a smart-glasses HUD: ≤80 chars, single line, no second sentence, no parentheticals unless they're load-bearing. Read in under 2 seconds at a glance.
+- Drop framing words ("The", "It is", "Note that"); keep the core fact. "Beholder AC: 18" not "A beholder has AC 18 (natural armor)".
+- Symbols and abbreviations are fine if they preserve meaning ("→", "≥", "K" for thousand). The HUD font is monospace-ish green text on a transparent display, so visual density matters.
+- If "cue" is null, "cueShort" must also be null.
+- If "cue" is non-null but no useful ≤80-char form exists (e.g., the answer genuinely needs the full 240 chars to be safe / correct / unambiguous), set "cueShort" to null. Better to skip the HUD than show a misleading truncation.
+- When in doubt, prefer brevity over completeness — the user can glance at the phone for the full cue.
+
 Rules for "segments":
 - One entry per contiguous span of single-speaker audio. Order by time.
 - Use the speaker's known name where possible. For unrecognised voices, use "New Person 1", "New Person 2", etc., consistently within the conversation. The user (device owner) is "Me".
@@ -141,7 +162,7 @@ Rules for "speakerNames":
 - Optional. If you hear an unknown speaker addressed by name in the conversation ("hey Bob, what do you think?") and you can map "New Person N" to a real name with reasonable confidence, include it.
 - Omit the field entirely if you have no rename to suggest.
 
-Always include "heard" and "segments". Never output anything other than the JSON object.`;
+Always include "heard", "segments", and both cue fields (use null when not applicable). Never output anything other than the JSON object.`;
 
 type GeminiPart = { text: string } | { inlineData: { mimeType: string; data: string } };
 type GeminiTurn = { role: 'user' | 'model'; parts: GeminiPart[] };
@@ -207,7 +228,11 @@ export class GeminiAudioOrchestrator {
     if (opts.initialHistory) {
       for (const e of opts.initialHistory) {
         if (!e.heard) continue;
-        const responseText = JSON.stringify({ heard: e.heard, cue: e.cue });
+        const responseText = JSON.stringify({
+          heard: e.heard,
+          cue: e.cue,
+          cueShort: e.cueShort ?? null,
+        });
         this.history.push({ role: 'user', parts: [{ text: e.heard }] });
         this.history.push({ role: 'model', parts: [{ text: responseText }] });
       }
@@ -240,7 +265,7 @@ export class GeminiAudioOrchestrator {
     if (this.opts.voiceReferences && this.opts.voiceReferences.length > 0) {
       const names = this.opts.voiceReferences.map((v) => v.name).join(', ');
       parts.push(
-        `--- known voice references ---\nVoice reference clips for the following people are included at the start of this conversation: ${names}. When you hear a voice that matches one of them, use that person's name in "heard" and "segments". For voices that don't match any reference, use "New Person 1", "New Person 2", etc. — keep the same label for the same voice across the whole conversation.`,
+        `--- known voice references ---\nVoice reference clips and notes for the following people are included at the start of this conversation: ${names}. When you hear a voice that matches one of them, use that person's name in "heard" and "segments". Use each person's notes — relationship to the user, role, what they typically discuss — as context to disambiguate similar voices (lean on topic, jargon, in-jokes when audio alone is ambiguous). For voices that don't match any reference, use "New Person 1", "New Person 2", etc. — keep the same label for the same voice across the whole conversation.`,
       );
     }
     if (this.opts.groupCatalog && this.opts.groupCatalog.length > 0) {
@@ -384,6 +409,7 @@ export class GeminiAudioOrchestrator {
       type: 'response',
       heard: parsed.heard,
       cue: parsed.cue,
+      cueShort: parsed.cueShort,
       latencyMs: Date.now() - startedAt,
       committed,
       bufferMsAfter: Math.round((this.pendingBytes / 2 / SAMPLE_RATE) * 1000),
@@ -402,10 +428,11 @@ export class GeminiAudioOrchestrator {
     const refs = this.opts.voiceReferences;
     if (!refs || refs.length === 0) return [];
     const parts: GeminiPart[] = [
-      { text: 'Voice reference clips for speakers in this conversation:' },
+      { text: 'Voice reference clips and notes for speakers in this conversation:' },
     ];
     for (const r of refs) {
-      parts.push({ text: `${r.name}:` });
+      const label = r.notes ? `${r.name} — notes: ${r.notes}` : r.name;
+      parts.push({ text: `${label}:` });
       parts.push({
         inlineData: {
           mimeType: 'audio/wav',
@@ -414,7 +441,7 @@ export class GeminiAudioOrchestrator {
       });
     }
     parts.push({
-      text: 'Use these to identify speakers by name in the "heard" field of your replies.',
+      text: 'Use these to identify speakers by name in the "heard" field of your replies. The notes describe each person\'s relationship to the user — use them as context when audio alone makes a voice hard to place.',
     });
     return [
       { role: 'user', parts },
@@ -437,6 +464,7 @@ export class GeminiAudioOrchestrator {
     this.opts.onCommit?.({
       heard,
       cue: parsed.cue,
+      cueShort: parsed.cueShort,
       audioPcm,
       segments: parsed.segments,
       speakerNames: parsed.speakerNames,
@@ -472,14 +500,21 @@ function parseResponse(raw: string): AudioResponse {
     .replace(/\s*```$/i, '');
   try {
     const parsed = JSON.parse(stripped) as Partial<AudioResponse>;
+    const cue =
+      typeof parsed.cue === 'string'
+        ? parsed.cue.trim() || null
+        : parsed.cue === null
+          ? null
+          : null;
+    const cueShortRaw =
+      typeof parsed.cueShort === 'string' ? parsed.cueShort.trim() || null : null;
+    // Force the contract: cueShort must be null when cue is null, regardless
+    // of what the model emitted. (Cheaper than retraining the prompt.)
+    const cueShort = cue ? cueShortRaw : null;
     return {
       heard: typeof parsed.heard === 'string' ? parsed.heard.trim() : '',
-      cue:
-        typeof parsed.cue === 'string'
-          ? parsed.cue.trim() || null
-          : parsed.cue === null
-            ? null
-            : null,
+      cue,
+      cueShort,
       segments: Array.isArray(parsed.segments)
         ? parsed.segments
             .filter(
@@ -516,7 +551,7 @@ function parseResponse(raw: string): AudioResponse {
           : undefined,
     };
   } catch {
-    return { heard: stripped, cue: null };
+    return { heard: stripped, cue: null, cueShort: null };
   }
 }
 

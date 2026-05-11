@@ -11,7 +11,11 @@ const BASE = '/lifebot/groups';
 export type Person = {
   id: string;
   name: string;
-  role?: string;
+  /** Free-form notes about the relationship to the user — sent to Gemini in
+   *  the priming turn so it can use context to disambiguate similar voices.
+   *  e.g. "DM of our Verdant Crown D&D campaign; runs sessions Sunday nights."
+   */
+  notes?: string;
   /** Set true once a voiceprint .wav has been uploaded for this person. */
   hasVoiceprint?: boolean;
 };

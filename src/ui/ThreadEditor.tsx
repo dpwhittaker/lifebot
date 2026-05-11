@@ -150,6 +150,23 @@ export function ThreadEditor({
     }
   };
 
+  const handleSetNotes = async (person: Person, notes: string) => {
+    const trimmed = notes.trim();
+    const next = trimmed ? trimmed : undefined;
+    if (next === (person.notes ?? undefined)) return;
+    try {
+      const updated: Person = { ...person, notes: next };
+      await savePerson(groupId, updated);
+      setGroup((g) =>
+        g
+          ? { ...g, people: g.people.map((p) => (p.id === person.id ? updated : p)) }
+          : g,
+      );
+    } catch (e) {
+      alert(`Couldn't update notes: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
   const handleRemovePerson = async (personId: string) => {
     if (!confirm(`Remove this person from the group?\nThey'll be removed from every thread in this group.`)) return;
     try {
@@ -274,7 +291,6 @@ export function ThreadEditor({
                       onChange={() => togglePerson(p.id)}
                     />
                     <span className="person-name">{p.name}</span>
-                    {p.role && <span className="person-role">{p.role}</span>}
                   </label>
                   <button
                     type="button"
@@ -292,6 +308,13 @@ export function ThreadEditor({
                     const fresh = await getGroup(groupId);
                     if (fresh) setGroup(fresh);
                   }}
+                />
+                <textarea
+                  defaultValue={p.notes ?? ''}
+                  onBlur={(e) => void handleSetNotes(p, e.target.value)}
+                  placeholder="Notes (relationship, role, ongoing context — Gemini sees these)"
+                  className="person-notes-input"
+                  rows={2}
                 />
               </div>
             ))}

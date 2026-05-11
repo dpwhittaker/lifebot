@@ -1,6 +1,12 @@
 export type Cue = {
   id: number;
   text: string;
+  /**
+   * Glanceable HUD form (≤80 chars). Shown beneath the full cue with a "G2"
+   * tag during Phase 2-prep so we can A/B against the long form in real
+   * sessions. Null when the model couldn't produce a useful short version.
+   */
+  short: string | null;
   createdAt: number;
   source: string;
 };
@@ -11,7 +17,7 @@ type Props = {
   onClear: () => void;
 };
 
-export function CuePane({ cues, onDismiss, onClear }: Props) {
+export function DomCueRenderer({ cues, onDismiss, onClear }: Props) {
   return (
     <div className="pane">
       <div className="pane-header">
@@ -41,6 +47,18 @@ export function CuePane({ cues, onDismiss, onClear }: Props) {
                 </button>
               </div>
               <div className="cue-body">{c.text}</div>
+              {c.short ? (
+                <div className="cue-short">
+                  <span className="cue-short-tag">G2</span>
+                  <span>{c.short}</span>
+                  <span className="cue-short-len">{c.short.length}c</span>
+                </div>
+              ) : (
+                <div className="cue-short cue-short-empty">
+                  <span className="cue-short-tag">G2</span>
+                  <span>— no short form available</span>
+                </div>
+              )}
               <div className="cue-source">↳ {c.source}</div>
             </div>
           ))

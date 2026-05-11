@@ -406,11 +406,23 @@ button {
 }
 .person-check:hover { background: var(--accent-soft); }
 .person-name { color: var(--text); }
-.person-role {
-  color: var(--text-muted);
+.person-notes-input {
+  background: var(--bg);
+  border: 1px solid var(--panel-edge);
+  border-radius: var(--radius-sm);
+  padding: var(--space-xs) var(--space-sm);
+  color: var(--text);
+  font: inherit;
   font-size: 12px;
-  font-style: italic;
+  width: 100%;
+  margin-left: 28px;
+  width: calc(100% - 28px);
+  resize: vertical;
+  text-transform: none;
+  letter-spacing: normal;
 }
+.person-notes-input:focus { border-color: var(--accent); outline: none; }
+.person-notes-input::placeholder { color: var(--text-muted); font-style: italic; }
 .person-remove {
   color: var(--text-muted);
   font-size: 16px;
@@ -457,34 +469,24 @@ button {
 .btn-active { background: var(--error); border-color: var(--error); color: var(--text); }
 .btn-ghost { border-color: var(--text-muted); color: var(--text-muted); font-weight: 600; }
 
-.split {
+/* 2x2 layout: top row = "what's happening" (transcript + DOM cues),
+   bottom row = "what the system is doing" (orchestrator log + G2 HUD preview).
+   Every grid cell is independently scrollable via its inner .pane. */
+.grid-2x2 {
   flex: 1;
-  /* Grid with two equal columns — flex was letting wide cue content push the
-     right column past 50%. Grid 1fr 1fr is enforced regardless of content. */
   display: grid;
   grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
   gap: var(--space-sm);
   padding: 0 var(--space-md) var(--space-md);
   min-height: 0;
 }
 
-.left-col {
+.grid-cell {
   display: flex;
   flex-direction: column;
-  gap: var(--space-sm);
   min-width: 0;
   min-height: 0;
-}
-
-/* Transcript and orchestrator log share the left column 50/50, each constrained
-   to its own slot so internal scrollbars handle overflow instead of pushing
-   the column off the page. */
-.transcript-wrap,
-.log-wrap {
-  flex: 1 1 0;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
 }
 
 .pane {
@@ -609,6 +611,120 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.cue-short {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  margin-top: var(--space-sm);
+  padding-top: var(--space-sm);
+  border-top: 1px dashed color-mix(in srgb, var(--accent) 30%, transparent);
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--text);
+}
+.cue-short-tag {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: var(--bg);
+  flex-shrink: 0;
+}
+.cue-short > span:nth-child(2) { flex: 1; word-wrap: break-word; overflow-wrap: break-word; }
+.cue-short-len {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.cue-short-empty { color: var(--text-muted); font-style: italic; }
+
+/* G2 HUD preview pane (Phase 2-preview). Faithful 576×288 simulation of the
+   on-glass display. The frame uses the G2's actual hue (#3CFA44) on near-black
+   so it reads the same as the real device — anything that's hard to read here
+   will be hard to read on glass. */
+.g2-meta-tag {
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+.g2-hud-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-md);
+  overflow: auto;
+}
+.g2-hud-frame {
+  width: 576px;
+  height: 288px;
+  flex-shrink: 0;
+  background: #050505;
+  border: 1px solid #1a1a1a;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 24px 32px;
+  box-shadow: inset 0 0 24px rgba(60, 250, 68, 0.04);
+}
+.g2-hud-text {
+  /* Font-size is set inline from the preview component so it can be tuned
+     against real hardware once the G2 firmware font's pixel height is known. */
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.g2-hud-line {
+  color: #3cfa44;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 500;
+  line-height: 1.15;
+  letter-spacing: 0.5px;
+  text-shadow: 0 0 6px rgba(60, 250, 68, 0.35);
+  white-space: pre;
+}
+.g2-controls { display: flex; align-items: center; gap: var(--space-md); }
+.g2-mode-tag {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+.g2-mode-live { color: #3cfa44; background: rgba(60, 250, 68, 0.12); }
+.g2-mode-dom  { color: var(--text-muted); background: rgba(148, 163, 184, 0.10); }
+.g2-hud-screenshot {
+  display: block;
+  width: 576px;
+  height: 288px;
+  image-rendering: pixelated;
+  /* The /api/screenshot/glasses endpoint exports the LVGL framebuffer as a
+     monochrome PNG (lit pixels = dark on white background). Recolor with a
+     filter chain so it visually matches the green-on-black look the
+     simulator window itself paints — invert flips fg/bg, then hue-rotate
+     pushes the now-white pixels toward G2 green. */
+  filter: invert(1) sepia(1) saturate(8) hue-rotate(60deg) brightness(1.1);
+}
+.g2-font-select {
+  background: var(--bg-elev);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 2px 4px;
+  margin-left: 6px;
+}
+.g2-hud-dark {
+  color: #1a3a1a;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+  letter-spacing: 1px;
 }
 
 /* Orchestrator log rows */
