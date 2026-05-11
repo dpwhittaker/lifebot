@@ -2,5 +2,7 @@
   "name": "lifebot",
   "createdAt": "2026-05-03T22:40:21-05:00",
   "openUrl": "/lifebot/",
-  "extraUnits": ["lifebot-static.service"]
+  "proxyTarget": "http://127.0.0.1:8003",
+  "stripPrefix": true,
+  "extraUnits": ["lifebot.service"]
 }

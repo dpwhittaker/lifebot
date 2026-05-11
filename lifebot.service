@@ -1,0 +1,17 @@
+[Unit]
+Description=lifebot backend (PWA static + threads/groups/voiceprints/logs API)
+Documentation=https://github.com/david/lifebot
+After=network.target
+
+[Service]
+Type=simple
+User=david
+WorkingDirectory=/home/david/projects/lifebot
+ExecStart=/home/david/.nvm/versions/node/v24.11.0/bin/node /home/david/projects/lifebot/server.cjs
+Environment=LIFEBOT_PORT=8003
+Restart=always
+RestartSec=2
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
