@@ -31,11 +31,32 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/sim-api/, ''),
       },
+      // Backend (server.cjs) for /lifebot/threads, /lifebot/groups,
+      // /lifebot/logs, /lifebot/voiceprints. In prod claude-hub does the same
+      // prefix strip; replicating it here keeps the client code unchanged.
+      // Without this proxy Vite returns the SPA's index.html for unknown
+      // paths, JSON.parse chokes on it, and WebKit (the simulator's WebView)
+      // reports "The string did not match the expected pattern."
+      '/lifebot': {
+        target: 'http://127.0.0.1:8003',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/lifebot/, ''),
+      },
     },
   },
-  // Avoid bundling onnxruntime-web's wasm assets — we ship them straight from
-  // public/ instead, so the runtime can fetch them at the same origin.
+  // Pre-bundle vad-web + onnxruntime-web so esbuild converts their internal
+  // `require("onnxruntime-web/wasm")` (CJS) into ESM. Vite 8 + Rolldown ships
+  // the raw require to the browser otherwise, which crashes app startup.
+  // The .wasm binaries themselves still come from public/ — we point ort at
+  // them at runtime via ort.env.wasm.wasmPaths (see WebAudioCapture.ts).
   optimizeDeps: {
-    exclude: ['onnxruntime-web'],
+    include: [
+      '@ricky0123/vad-web',
+      '@ricky0123/vad-web/dist/models/v5',
+      '@ricky0123/vad-web/dist/default-model-fetcher',
+      '@ricky0123/vad-web/dist/frame-processor',
+      'onnxruntime-web',
+      'onnxruntime-web/wasm',
+    ],
   },
 });
