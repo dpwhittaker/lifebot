@@ -667,26 +667,83 @@ button {
   border: 1px solid #1a1a1a;
   border-radius: 4px;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: flex-start;
-  padding: 24px 32px;
+  padding: 0;
   box-shadow: inset 0 0 24px rgba(60, 250, 68, 0.04);
+  overflow: hidden;
 }
-.g2-hud-text {
-  /* Font-size is set inline from the preview component so it can be tuned
-     against real hardware once the G2 firmware font's pixel height is known. */
+/* Two-pane HUD: transcript (left) + cue list (right). 50/50 split mirrors
+   the G2HudRenderer container geometry (288 px each). 28 px line-height
+   matches Even's design guideline target of ~10 rows.
+   Brightness levels per Even's design language:
+     - normal text: #AA brightness (~67% of full) → use base green at 0.67 α
+     - bold text:   #FF brightness (full) → use base green at 1.0 α via .g2-hud-bold
+   On the actual G2 the channel is monochrome (single-hue green); we mimic
+   the two brightness levels via opacity here. */
+.g2-hud-split {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: rgba(60, 250, 68, 0.67);
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  text-shadow: 0 0 6px rgba(60, 250, 68, 0.25);
+}
+.g2-hud-bold {
+  color: #3cfa44;
+  font-weight: 700;
+  text-shadow: 0 0 6px rgba(60, 250, 68, 0.45);
+}
+.g2-hud-transcript {
+  flex: 1 1 50%;
+  padding: 8px 10px;
+  font-size: 16px;
+  line-height: 28px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-y: auto;
+  scrollbar-width: none; /* hide scrollbar — mimics firmware, no chrome */
+  border-right: 1px solid rgba(60, 250, 68, 0.12);
+}
+.g2-hud-transcript::-webkit-scrollbar { display: none; }
+.g2-hud-cues {
+  flex: 1 1 50%;
+  padding: 8px 10px;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  font-size: 13px;
+  line-height: 18px;
+  overflow-y: auto;
+  scrollbar-width: none;
 }
-.g2-hud-line {
+.g2-hud-cues::-webkit-scrollbar { display: none; }
+.g2-hud-cue-item {
+  display: flex;
+  gap: 4px;
+  padding: 2px 0;
+  word-wrap: break-word;
+}
+.g2-hud-cue-marker {
+  flex-shrink: 0;
+  width: 8px;
+  text-align: center;
+  /* Reserved column so item text aligns whether or not the marker is drawn. */
+}
+.g2-hud-cue-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.g2-hud-cue-item--focused .g2-hud-cue-marker {
   color: #3cfa44;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-weight: 500;
-  line-height: 1.15;
-  letter-spacing: 0.5px;
-  text-shadow: 0 0 6px rgba(60, 250, 68, 0.35);
-  white-space: pre;
+  font-weight: 700;
+  text-shadow: 0 0 6px rgba(60, 250, 68, 0.45);
+}
+.g2-hud-placeholder {
+  color: #1a3a1a;
+  font-style: italic;
 }
 .g2-controls { display: flex; align-items: center; gap: var(--space-md); }
 .g2-mode-tag {
@@ -709,22 +766,6 @@ button {
      simulator window itself paints — invert flips fg/bg, then hue-rotate
      pushes the now-white pixels toward G2 green. */
   filter: invert(1) sepia(1) saturate(8) hue-rotate(60deg) brightness(1.1);
-}
-.g2-font-select {
-  background: var(--bg-elev);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  font-size: 11px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  padding: 2px 4px;
-  margin-left: 6px;
-}
-.g2-hud-dark {
-  color: #1a3a1a;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 14px;
-  letter-spacing: 1px;
 }
 
 /* Orchestrator log rows */

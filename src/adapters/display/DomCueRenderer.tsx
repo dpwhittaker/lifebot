@@ -1,3 +1,7 @@
+import { useMemo, useRef } from 'react';
+
+import { useStickyScrollBottom } from '../../util/useStickyScrollBottom';
+
 export type Cue = {
   id: number;
   text: string;
@@ -18,6 +22,13 @@ type Props = {
 };
 
 export function DomCueRenderer({ cues, onDismiss, onClear }: Props) {
+  const bodyRef = useRef<HTMLDivElement>(null);
+  // App.tsx stores cues newest-first (prepend on commit). For chronological
+  // top-to-bottom display we render in reverse — the original ordering stays
+  // unchanged so other consumers (HUD, persistence) still see "newest first".
+  const ordered = useMemo(() => cues.slice().reverse(), [cues]);
+  useStickyScrollBottom(bodyRef, ordered.length);
+
   return (
     <div className="pane">
       <div className="pane-header">
@@ -27,14 +38,14 @@ export function DomCueRenderer({ cues, onDismiss, onClear }: Props) {
         </button>
       </div>
 
-      <div className="pane-body">
-        {cues.length === 0 ? (
+      <div className="pane-body" ref={bodyRef}>
+        {ordered.length === 0 ? (
           <div className="pane-empty">
             No cues yet. The orchestrator will surface helpful context as the conversation
             unfolds.
           </div>
         ) : (
-          cues.map((c) => (
+          ordered.map((c) => (
             <div className="cue-card" key={c.id}>
               <div className="cue-head">
                 <span className="cue-time">{formatTime(c.createdAt)}</span>

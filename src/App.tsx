@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
+import { G2AudioCapture } from './adapters/audio/G2AudioCapture';
+import type { AudioCapture } from './adapters/audio/types';
 import { WebAudioCapture } from './adapters/audio/WebAudioCapture';
+import { waitForEvenAppBridge } from '@evenrealities/even_hub_sdk';
 import { GeminiAudioOrchestrator } from './orchestrator/GeminiAudio';
 import { classifyConversation, type ClassifierResult } from './orchestrator/Classifier';
 import { Controls } from './ui/Controls';
@@ -40,6 +43,22 @@ import {
 import type { CommitEntry, VoiceReference } from './orchestrator/GeminiAudio';
 import { pcm16ToWav } from './util/wav';
 import type { Thread, ThreadSummary } from './threads/types';
+
+function raceWithTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
+}
 
 const API_KEY: string = (import.meta.env.VITE_GEMINI_API_KEY as string | undefined) ?? '';
 const MODEL: string =
@@ -179,7 +198,7 @@ export function App() {
   const [log, setLog] = useState<LogEntry[]>([]);
   const logSeq = useRef(0);
 
-  const captureRef = useRef<WebAudioCapture | null>(null);
+  const captureRef = useRef<AudioCapture | null>(null);
   const orchestratorRef = useRef<GeminiAudioOrchestrator | null>(null);
   const hudRendererRef = useRef<G2HudRenderer | null>(null);
   const uploaderRef = useRef<LogUploader>(new LogUploader());
@@ -206,8 +225,8 @@ export function App() {
   }, []);
 
   // ---- G2 bridge renderer (no-op if no Even Hub bridge is present, e.g.
-  //      plain browser dev). Lives the whole app lifetime; receives every
-  //      committed cue's `short` form.
+  //      plain browser dev). Lives the whole app lifetime; receives both the
+  //      transcript pane and cue list pane via the useEffects below.
   useEffect(() => {
     const renderer = new G2HudRenderer();
     hudRendererRef.current = renderer;
@@ -221,6 +240,34 @@ export function App() {
       hudRendererRef.current = null;
     };
   }, [appendLog]);
+
+  // ---- HUD content derivation ----
+  // Transcript pane: the latest "heard" text. Each Gemini call refines the
+  // current uncommitted window; we show that one chunk so the HUD mirrors
+  // what the user is talking about *now*. Earlier turns live in CuePane and
+  // the OrchestratorLog.
+  const hudTranscript = useMemo(() => {
+    const latest = chunks[chunks.length - 1];
+    return latest?.text ?? '';
+  }, [chunks]);
+
+  // Cue list pane: the most recent cueShort values, newest first. Falls back
+  // to the full `cue` text when the model didn't emit a short form.
+  const hudCueItems = useMemo(
+    () =>
+      cues
+        .map((c) => c.short ?? c.text)
+        .filter((s): s is string => !!s),
+    [cues],
+  );
+
+  useEffect(() => {
+    hudRendererRef.current?.setTranscript(hudTranscript);
+  }, [hudTranscript]);
+
+  useEffect(() => {
+    hudRendererRef.current?.setCues(hudCueItems);
+  }, [hudCueItems]);
 
   // ---- initial load: ensure Ad-hoc group + thread, then load all ----
   useEffect(() => {
@@ -469,7 +516,9 @@ export function App() {
               ...prev,
             ].slice(0, 50),
           );
-          hudRendererRef.current?.showCue(response.cueShort);
+          // HUD output is now driven by transcript + cue list state, pushed
+          // to the renderer via the useEffects below — no per-response call
+          // needed here.
         }
         setPendingCues((n) => Math.max(0, n - 1));
       },
@@ -493,9 +542,12 @@ export function App() {
     });
     orchestratorRef.current = orchestrator;
 
-    const capture = new WebAudioCapture(orchestrator, {
-      onVadActive: (a) => setVadActive(a),
-      onVadEvent: (kind, info) => {
+    const captureCallbacks = {
+      onVadActive: (a: boolean) => setVadActive(a),
+      onVadEvent: (
+        kind: 'speech_start' | 'speech_end' | 'misfire' | 'merge' | 'flush',
+        info?: { samples?: number; bufferMs?: number; reason?: string },
+      ) => {
         let text = '';
         let logKind: LogEntry['kind'] = 'sent';
         switch (kind) {
@@ -524,10 +576,30 @@ export function App() {
       onAudioSent: () => {
         setPendingCues((n) => n + 1);
       },
-      onError: (msg) => appendLog({ kind: 'error', at: Date.now(), text: msg }),
-      onStatusChange: (a) => setActive(a),
-    });
-    captureRef.current = capture;
+      onError: (msg: string) => appendLog({ kind: 'error', at: Date.now(), text: msg }),
+      onStatusChange: (a: boolean) => setActive(a),
+    };
+
+    // Pick the audio adapter based on whether the Even Hub bridge is
+    // present. In plain Chrome we use getUserMedia (WebAudioCapture); in
+    // the Even Hub WebView / evenhub-simulator we use bridge.audioControl
+    // (G2AudioCapture). The bridge race is short-circuited by a 1.5 s
+    // timeout — same heuristic G2HudRenderer.init uses.
+    void (async () => {
+      const bridge = await raceWithTimeout(waitForEvenAppBridge(), 1500);
+      if (cancelled) return;
+      const capture: AudioCapture = bridge
+        ? new G2AudioCapture(orchestrator, captureCallbacks)
+        : new WebAudioCapture(orchestrator, captureCallbacks);
+      captureRef.current = capture;
+      appendLog({
+        kind: 'sent',
+        at: Date.now(),
+        text: bridge
+          ? 'audio: G2 bridge mode (audioControl)'
+          : 'audio: browser mic mode (getUserMedia)',
+      });
+    })();
 
     return () => {
       cancelled = true;
@@ -535,8 +607,14 @@ export function App() {
       captureRef.current = null;
       orchestratorRef.current = null;
     };
+    // activeGroup is intentionally NOT in the dep list: it isn't read inside
+    // this effect, and processSpeakerDiscovery calls setActiveGroup() when
+    // it materialises a new person mid-session. With activeGroup as a dep
+    // the orchestrator would re-create on every roster update, which clears
+    // chunks/cues and blanks both HUD panes for a frame — looks exactly
+    // like the simulator just rebooted.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeThread, activeGroup, appendLog]);
+  }, [activeThread, appendLog]);
 
   // ---- passive speaker discovery ----
   const processSpeakerDiscovery = useCallback(
@@ -1009,7 +1087,7 @@ export function App() {
           <OrchestratorLog entries={log} />
         </div>
         <div className="grid-cell">
-          <G2HudPreview cues={cues} />
+          <G2HudPreview transcript={hudTranscript} cues={cues} />
         </div>
       </div>
 

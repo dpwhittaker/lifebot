@@ -1,4 +1,6 @@
-import { useEffect, useRef } from 'react';
+import { useRef } from 'react';
+
+import { useStickyScrollBottom } from '../util/useStickyScrollBottom';
 
 export type TranscriptChunk = {
   id: number;
@@ -17,13 +19,11 @@ type Props = {
 export function TranscriptPane({ chunks, active, vadActive }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (chunks.length === 0) return;
-    requestAnimationFrame(() => {
-      const el = bodyRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-    });
-  }, [chunks.length]);
+  // Stick to bottom while the user hasn't scrolled away. Trigger on
+  // chunks.length (new turn) and the latest text mutation (a "live" chunk
+  // refining its text as more audio arrives within the same window).
+  const latestText = chunks[chunks.length - 1]?.text ?? '';
+  useStickyScrollBottom(bodyRef, `${chunks.length}|${latestText.length}`);
 
   return (
     <div className="pane">

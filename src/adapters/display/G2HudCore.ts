@@ -1,79 +1,79 @@
 /**
- * Rendering logic for the G2 HUD — frame layout, debounce, fade. Sink-agnostic.
+ * Composer for the G2 HUD's two-pane layout.
  *
- * Two consumers:
- *   - G2HudPreview (DOM div in the PWA)  → onFrame writes to React state
- *   - G2HudRenderer (Phase 3-real)       → onFrame calls bridge.textContainerUpgrade
+ * 576 × 288 screen, ~10 rows of text at the firmware default line-height (per
+ * Even's design guidelines). Split 50/50 vertically:
  *
- * Constraints we're modelling:
- *   - ≥120 ms between writes (BLE queue saturates faster — Even's ASR template
- *     uses this same number).
- *   - Auto-clear after `fadeMs` of no new cue (HUD dark by default).
- *   - 2 lines × ~25 chars per line, hard truncate with "…".
+ *   ┌──────────────────┬──────────────────┐
+ *   │ transcript pane  │ cue list pane    │
+ *   │ (text container) │ (list container) │
+ *   └──────────────────┴──────────────────┘
+ *        288 px              288 px
+ *
+ * Sink-agnostic — `onFrame` carries both panes' current content. Two
+ * consumers:
+ *   - G2HudPreview (DOM-mocked side-by-side in the PWA)
+ *   - G2HudRenderer (real bridge: TextContainerUpgrade + RebuildPageContainer)
+ *
+ * No fade. Transcript scrolls naturally; cue items persist until newer ones
+ * push them off. The screen blanking is handled by the glasses firmware
+ * itself, not by this layer.
  */
 
-export type HudFrame = { lines: string[] } | null;
+export type HudFrame = {
+  transcript: string;
+  cues: string[];
+};
 
 export type G2HudCoreOpts = {
   onFrame: (frame: HudFrame) => void;
-  /** Min ms between writes to the sink. */
+  /** Min ms between writes to the sink. Default 120 ms (matches Even's ASR
+   *  template). The BLE queue saturates faster than that. */
   debounceMs?: number;
-  /** Auto-clear after this many ms of no new cue. */
-  fadeMs?: number;
-  /** Max characters per line at the firmware font size. */
-  maxCharsPerLine?: number;
-  /** Max lines per frame. */
-  maxLines?: number;
 };
 
 export class G2HudCore {
   private readonly opts: G2HudCoreOpts;
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  private fadeTimer: ReturnType<typeof setTimeout> | null = null;
-  private pending: HudFrame = null;
+  private transcript = '';
+  private cues: string[] = [];
+  private dirty = false;
   private lastWriteAt = 0;
-  private current: HudFrame = null;
 
   constructor(opts: G2HudCoreOpts) {
     this.opts = opts;
   }
 
-  showText(text: string): void {
-    const frame: HudFrame = { lines: layoutHudFrame(text, this.maxCharsPerLine, this.maxLines) };
-    this.schedule(frame);
+  setTranscript(text: string): void {
+    if (text === this.transcript) return;
+    this.transcript = text;
+    this.dirty = true;
+    this.schedule();
   }
 
-  clear(): void {
-    this.schedule(null);
+  setCues(items: string[]): void {
+    if (arraysEqual(items, this.cues)) return;
+    this.cues = items.slice();
+    this.dirty = true;
+    this.schedule();
+  }
+
+  /** Currently-committed frame (last value passed to onFrame). */
+  get currentFrame(): HudFrame {
+    return { transcript: this.transcript, cues: this.cues.slice() };
   }
 
   destroy(): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
-    if (this.fadeTimer) clearTimeout(this.fadeTimer);
     this.debounceTimer = null;
-    this.fadeTimer = null;
-  }
-
-  /** Currently-displayed frame (for inspecting in the preview). */
-  get currentFrame(): HudFrame {
-    return this.current;
   }
 
   private get debounceMs(): number {
     return this.opts.debounceMs ?? 120;
   }
-  private get fadeMs(): number {
-    return this.opts.fadeMs ?? 7000;
-  }
-  private get maxCharsPerLine(): number {
-    return this.opts.maxCharsPerLine ?? 25;
-  }
-  private get maxLines(): number {
-    return this.opts.maxLines ?? 2;
-  }
 
-  private schedule(frame: HudFrame): void {
-    this.pending = frame;
+  private schedule(): void {
+    if (!this.dirty) return;
     const elapsed = Date.now() - this.lastWriteAt;
     if (elapsed >= this.debounceMs) {
       this.flush();
@@ -86,45 +86,13 @@ export class G2HudCore {
   private flush(): void {
     this.debounceTimer = null;
     this.lastWriteAt = Date.now();
-    this.current = this.pending;
-    this.opts.onFrame(this.current);
-    if (this.fadeTimer) clearTimeout(this.fadeTimer);
-    if (this.current !== null) {
-      this.fadeTimer = setTimeout(() => {
-        this.current = null;
-        this.fadeTimer = null;
-        this.opts.onFrame(null);
-      }, this.fadeMs);
-    }
+    this.dirty = false;
+    this.opts.onFrame({ transcript: this.transcript, cues: this.cues.slice() });
   }
 }
 
-/**
- * Word-wrap to N lines × M chars. Hard-truncates the last line with "…" if
- * input doesn't fit. Single oversized words are broken at the line boundary.
- */
-export function layoutHudFrame(text: string, maxCharsPerLine: number, maxLines: number): string[] {
-  const lines: string[] = [];
-  const words = text.split(/\s+/).filter(Boolean);
-  let i = 0;
-  while (i < words.length && lines.length < maxLines) {
-    let line = words[i++];
-    if (line.length > maxCharsPerLine) {
-      // Single word longer than a line — break it.
-      lines.push(line.slice(0, maxCharsPerLine));
-      words.splice(i, 0, line.slice(maxCharsPerLine));
-      continue;
-    }
-    while (i < words.length && line.length + 1 + words[i].length <= maxCharsPerLine) {
-      line += ' ' + words[i++];
-    }
-    lines.push(line);
-  }
-  if (i < words.length && lines.length > 0) {
-    const last = lines[lines.length - 1];
-    const room = maxCharsPerLine - last.length;
-    lines[lines.length - 1] =
-      room >= 1 ? last + '…' : last.slice(0, maxCharsPerLine - 1) + '…';
-  }
-  return lines;
+function arraysEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
