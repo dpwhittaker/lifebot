@@ -69,6 +69,12 @@ PLAN.md                        Original product brief.
 README.md                      Public-facing setup instructions.
 ```
 
+## Commit and push cadence
+
+Commit **and push** to `origin/main` after any significant change — new files, refactors, prompt or UX-behavior changes, dep churn. "Significant" = anything beyond a typo or a comment tweak. The working tree should rarely hold more than ~30 minutes of unpushed work; never end a session with uncommitted edits.
+
+Group related edits into one logical commit (e.g. all the HUD-layout files in one go) rather than committing per file. Match the existing commit style — short imperative title, optional body that explains the *why* and lists the moving parts.
+
 ## Dev workflow
 
 ```sh
