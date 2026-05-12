@@ -131,7 +131,7 @@ Respond with ONLY a JSON object of shape:
 {
   "heard":    "<one-line transcript of all speech, prefixed by speaker (Sarah: hi. Me: hey.)>",
   "cue":      "<the actual answer or fact, ≤240 chars>" | null,
-  "cueShort": "<same answer compressed for a heads-up display, ≤80 chars, single line>" | null,
+  "cueShort": "<HUD form of the cue, ≤200 chars, firmware word-wraps to ~34×6>" | null,
   "segments": [
     {"speaker": "Sarah",        "startSec": 0.0, "endSec": 3.5},
     {"speaker": "New Person 1", "startSec": 3.5, "endSec": 7.2}
@@ -144,14 +144,26 @@ Rules for "cue":
 - Produce a cue only when a speaker stated a specific factual claim worth verifying, asked an answerable factual question, mentioned a D&D rule / definition / name / date / formula, or explicitly requested data.
 - Keep cues under 240 characters. Pure information, no narration.
 - Otherwise output null. Skip filler / opinions / chit-chat / ambient noise / questions you can't actually answer.
+- **Do NOT re-cue something you've already shown.** Look at your last 5 model turns in this conversation. If a speaker (especially "Me") says aloud a fact that appears in any of those turns' "cue" or "cueShort" — a verse, formula, definition, name, date, statistic, quote — set "cue" and "cueShort" to null. The user is almost certainly reading the HUD off their glasses to the room, not asking for the answer again. Match on the underlying *reference* (e.g. same Bible verse, same monster's AC, same person's birth year), not on verbatim wording. Only re-cue if the speaker is challenging or correcting the prior cue, in which case the new cue should address the correction, not repeat the original fact.
+- **Scripture / verse references — quote the verse itself, ALWAYS, in BOTH cue and cueShort.** The HUD is the user's on-the-spot reference checker; an abbreviated label is useless because they're trying to verify the wording, not jog their memory of the citation. Format \`cue\` as \`<citation>: "<verbatim text>"\` and \`cueShort\` as \`*<citation>* <verbatim text>\` — citation wrapped in literal asterisks (no markdown, the firmware renders them as-is, they're a visual marker), single space, then the verbatim verse text, no quotation marks. This rule has zero exceptions — even if the verse is long, do not summarise; the cueShort budget (200 chars) accommodates almost every Bible verse in full. Use a recognised translation (default ESV for Bible).
+  EXAMPLES of CORRECT cueShort for a verse reference:
+    - "*Psalm 74:14* You crushed the heads of Leviathan and gave him as food to the creatures of the wilderness." ✓
+    - "*Revelation 6:10* They cried out with a loud voice, 'O Sovereign Lord, holy and true, how long before you will judge and avenge our blood on those who dwell on the earth?'" ✓
+  EXAMPLES of WRONG cueShort for a verse reference (do NOT do any of these):
+    - "Revelation 6:10: Martyrs cry out for justice." ✗ (summary instead of verse text)
+    - "Psalm 74:14: Leviathan reference." ✗ (label instead of verse text)
+    - "Crushed Leviathan; fed to creatures." ✗ (paraphrased)
+    - "You crushed the heads of Leviathan..." ✗ (missing the *citation* prefix)
+  The same applies to song lyrics, poem lines, legal citations, RFC sections, statute text — when the user names a reference they want the actual words AND the reference itself, never a description of them. Use the same \`*<citation>* <verbatim text>\` format for those too (e.g. "*RFC 9110 §15.5.4* The 404 (Not Found) status code indicates that the origin server did not find a current representation for the target resource…").
+- **"context" is a keyword.** When any speaker says the word "context" (e.g. "what's the context?", "give me context", just "context"), do not look up a new fact — instead, summarise the surrounding scene / argument / chapter of the most recently *referenced* scripture verse in this conversation (or whichever passage / topic is most recently active if it isn't a verse). If no verse or passage has been referenced yet, fall back to the most recently cued item. Format the cue as a 1-2 sentence summary; keep cueShort to a single sentence ≤80 chars. Example: speaker says "context?" right after Psalm 74:14 was cued → cue: "Psalm 74 is a communal lament: Asaph cries out as enemies destroy the sanctuary, then recounts God's past power — splitting the sea, crushing Leviathan — to plead for present rescue."
 
 Rules for "cueShort":
-- The same cue, compressed for a smart-glasses HUD: ≤80 chars, single line, no second sentence, no parentheticals unless they're load-bearing. Read in under 2 seconds at a glance.
-- Drop framing words ("The", "It is", "Note that"); keep the core fact. "Beholder AC: 18" not "A beholder has AC 18 (natural armor)".
+- The HUD form of the cue. **≤200 chars** total, fits on a 576×288 monochrome green display (about 34 chars × 6 lines after the firmware word-wraps). Treat it as a quick reference card the user reads while still in the conversation, not a one-glance status.
+- Use the cue text as-is when it already fits within 200 chars. Trim framing words ("The", "It is", "Note that") and parentheticals only if needed to fit. "Beholder AC: 18" not "A beholder has AC 18 (natural armor)" when space matters; either is fine when it fits.
 - Symbols and abbreviations are fine if they preserve meaning ("→", "≥", "K" for thousand). The HUD font is monospace-ish green text on a transparent display, so visual density matters.
+- For verse references, cueShort format is \`*<citation>* <verbatim text>\` (citation in literal asterisks, single space, verbatim verse text, no quotation marks, no summary, no paraphrase). See the verse-reference rule above for examples of correct vs. wrong cueShort values — this is the single most important rule for cueShort.
 - If "cue" is null, "cueShort" must also be null.
-- If "cue" is non-null but no useful ≤80-char form exists (e.g., the answer genuinely needs the full 240 chars to be safe / correct / unambiguous), set "cueShort" to null. Better to skip the HUD than show a misleading truncation.
-- When in doubt, prefer brevity over completeness — the user can glance at the phone for the full cue.
+- If "cue" is non-null but exceeds 200 chars and can't be safely trimmed, set "cueShort" to null rather than show a misleading truncation.
 
 Rules for "segments":
 - One entry per contiguous span of single-speaker audio. Order by time.
