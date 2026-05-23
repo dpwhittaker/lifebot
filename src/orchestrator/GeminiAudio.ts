@@ -62,6 +62,21 @@ export type AudioResponse = {
    * on jargon, project names, attendees.
    */
   groupHint?: { groupId: string; confidence: 'low' | 'medium' | 'high' };
+  /**
+   * Delta-transcript tail replacement. The trailing substring of the current
+   * live (uncommitted) transcript that this `heard` should overwrite — used to
+   * correct an earlier mishear once more audio disambiguates it. Applied only
+   * when it is an actual suffix of the live buffer; otherwise ignored (fail
+   * safe). Only meaningful in `transcriptMode: 'delta'`.
+   */
+  replaces?: string;
+  /**
+   * Empty-cue commit signal. True when a complete thought finished but nothing
+   * is worth highlighting on the HUD — commits the accumulated transcript and
+   * truncates the audio window (cheap "I heard a full thought" marker) without
+   * surfacing a cue.
+   */
+  commit?: boolean;
 };
 
 export type SpeakerSegment = {
@@ -114,6 +129,34 @@ export type GeminiAudioOptions = {
    * reset the audio buffer so cost doesn't grow unboundedly.
    */
   softCommitSec?: number;
+  /**
+   * If > 0, the orchestrator paces requests on a fixed timer (every
+   * `sendIntervalMs` ms) rather than firing on each VAD turn. Audio keeps
+   * accumulating between ticks; each tick sends the whole window (subject to
+   * the inflight guard — a request never overlaps the previous one). 0 keeps
+   * the legacy VAD-triggered behaviour.
+   */
+  sendIntervalMs?: number;
+  /**
+   * Cadence used while VAD reports no speech. Audio still streams in and is
+   * still sent (so the model can catch sub-threshold/far-field speech the VAD
+   * misses) — just at this slower rate. Default 30000 (30s). VAD only gates
+   * *cadence*, never which audio is sent.
+   */
+  idleIntervalMs?: number;
+  /**
+   * After a commit (cue or empty-cue), trim the pending audio down to this
+   * many milliseconds of trailing context so the next window starts short.
+   * Only applied in interval mode. Default 2000.
+   */
+  maxBufferAfterCommitMs?: number;
+  /**
+   * 'delta' — the model returns only newly-heard speech each request and we
+   * reassemble the live transcript locally (cheaper output). 'full' — the
+   * model returns the whole window transcript each time (legacy). Default
+   * 'full'.
+   */
+  transcriptMode?: 'full' | 'delta';
   fetchImpl?: typeof fetch;
   onTrace?: (event: AudioOrchestratorTrace) => void;
   onResponse?: (response: AudioResponse) => void;
@@ -122,6 +165,9 @@ export type GeminiAudioOptions = {
 };
 
 const SAMPLE_RATE = 16000;
+/** Stay on the fast cadence this long after speech ends, so inter-word gaps
+ *  don't bounce the cadence down to idle mid-sentence. */
+const SPEAKING_GRACE_MS = 2000;
 
 const DEFAULT_SYSTEM_INSTRUCTION = `You are a passive session monitor for an in-person conversation (e.g., a tabletop game, study group, meeting).
 
@@ -129,7 +175,9 @@ Each request includes a stretch of audio that may contain multiple speakers, par
 
 Respond with ONLY a JSON object of shape:
 {
-  "heard":    "<one-line transcript of all speech, prefixed by speaker (Sarah: hi. Me: hey.)>",
+  "heard":    "<transcript of speech you have NOT already reported, prefixed by speaker (Sarah: hi. Me: hey.)>",
+  "replaces": "<trailing text of your previous transcript to overwrite, or omit>",
+  "commit":   true | false,
   "cue":      "<the actual answer or fact, ≤240 chars>" | null,
   "cueShort": "<HUD form of the cue, ≤200 chars, firmware word-wraps to ~34×6>" | null,
   "segments": [
@@ -138,6 +186,16 @@ Respond with ONLY a JSON object of shape:
   ],
   "speakerNames": { "New Person 1": "Bob" }   // optional rename hints
 }
+
+Rules for "heard" (DELTA transcript):
+- The same audio window grows across requests — earlier audio is re-sent each time. Report ONLY the speech that is NEW since your previous reply; do not repeat text you already transcribed. On the very first request for a window, transcribe everything you hear.
+- If newer audio makes you realise an earlier word was wrong (e.g. you said "there" but the finished sentence shows it was "their parents"), set "replaces" to the exact trailing snippet of your *previous* transcript to overwrite, and put the corrected text in "heard". Example: previous "...meet them over there", now realise → replaces: "over there", heard: "over their parents'". Use this sparingly, only for genuine corrections. Omit "replaces" when simply appending new speech.
+- Keep speaker prefixes consistent with earlier turns.
+
+Rules for "commit":
+- Set true when a speaker has finished a complete thought / sentence AND you are emitting (or have already emitted) any cue for it, OR when a complete thought finished but nothing is worth a cue ("empty cue"). Committing tells the system the window can be truncated — keep it flowing so audio windows stay short.
+- Set false (or omit) while a thought is still mid-sentence and more context may change the transcript or produce a cue.
+- Whenever "cue" is non-null, "commit" must be true.
 
 Rules for "cue":
 - A cue is for the LISTENER (someone watching the screen) — give them the *answer* or *fact*, not a description of what was asked. If a player asks "what's the AC of a beholder?" the cue is "Beholder AC: 18 (natural armor)", NOT "The speaker asked for the beholder's AC".
@@ -174,7 +232,7 @@ Rules for "speakerNames":
 - Optional. If you hear an unknown speaker addressed by name in the conversation ("hey Bob, what do you think?") and you can map "New Person N" to a real name with reasonable confidence, include it.
 - Omit the field entirely if you have no rename to suggest.
 
-Always include "heard", "segments", and both cue fields (use null when not applicable). Never output anything other than the JSON object.`;
+Always include "heard", "commit", "segments", and both cue fields (use null when not applicable). Never output anything other than the JSON object.`;
 
 type GeminiPart = { text: string } | { inlineData: { mimeType: string; data: string } };
 type GeminiTurn = { role: 'user' | 'model'; parts: GeminiPart[] };
@@ -208,6 +266,10 @@ export class GeminiAudioOrchestrator {
   private readonly fetchImpl: typeof fetch;
   private readonly maxHistoryTurns: number;
   private readonly softCommitBytes: number;
+  private readonly activeIntervalMs: number;
+  private readonly idleIntervalMs: number;
+  private readonly maxBufferAfterCommitBytes: number;
+  private readonly transcriptMode: 'full' | 'delta';
   /** Recomputed when voice references change. */
   private systemInstruction: string;
 
@@ -217,6 +279,15 @@ export class GeminiAudioOrchestrator {
   private pendingAudio: Uint8Array[] = [];
   /** Cached total byte length of pendingAudio. */
   private pendingBytes = 0;
+  /** Reassembled uncommitted transcript (delta mode accumulates here). */
+  private liveTranscript = '';
+  /** Self-rescheduling timer that paces sends, when activeIntervalMs > 0. */
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  /** VAD-driven cadence gate. `speaking` while a turn is open; after speech
+   *  ends we linger on the fast cadence until `speakingUntilMs` so brief
+   *  inter-word gaps don't drop us to the idle rate mid-sentence. */
+  private speaking = false;
+  private speakingUntilMs = 0;
 
   /** How many of pendingAudio's frames are part of the in-flight request. */
   private inflightCount = 0;
@@ -235,6 +306,11 @@ export class GeminiAudioOrchestrator {
     this.systemInstruction = this.buildSystemInstruction();
     const softCommitSec = opts.softCommitSec ?? 300; // 5 minutes
     this.softCommitBytes = softCommitSec * SAMPLE_RATE * 2; // 16-bit mono
+    this.activeIntervalMs = opts.sendIntervalMs ?? 0;
+    this.idleIntervalMs = opts.idleIntervalMs ?? 30_000;
+    const maxBufferMs = opts.maxBufferAfterCommitMs ?? 2000;
+    this.maxBufferAfterCommitBytes = Math.round((maxBufferMs / 1000) * SAMPLE_RATE * 2);
+    this.transcriptMode = opts.transcriptMode ?? 'full';
 
     // Seed history from a thread's prior commits, if provided.
     if (opts.initialHistory) {
@@ -257,6 +333,71 @@ export class GeminiAudioOrchestrator {
     this.pendingAudio = [];
     this.pendingBytes = 0;
     this.dirty = false;
+    this.liveTranscript = '';
+    this.speaking = false;
+    this.speakingUntilMs = 0;
+  }
+
+  /** Begin interval-paced sending (no-op unless sendIntervalMs > 0). */
+  start(): void {
+    if (this.activeIntervalMs <= 0 || this.timer) return;
+    this.scheduleNext();
+  }
+
+  /** Stop interval-paced sending. */
+  stop(): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
+  /**
+   * VAD cadence gate. `true` when speech is detected → fast (active) cadence;
+   * `false` → idle cadence after a short grace. Audio streaming is unaffected:
+   * all of it is still buffered and sent regardless of this flag.
+   */
+  setSpeaking(speaking: boolean): void {
+    if (speaking) {
+      this.speaking = true;
+      // Speech started during an idle wait — pull the next send forward
+      // instead of sitting on the (up to 30s) idle timer.
+      if (this.timer) {
+        clearTimeout(this.timer);
+        this.timer = null;
+        this.scheduleNext();
+      }
+    } else {
+      this.speaking = false;
+      this.speakingUntilMs = Date.now() + SPEAKING_GRACE_MS;
+    }
+  }
+
+  /** Force one evaluate immediately if idle (tap "send now"). */
+  sendNow(): void {
+    this.tick();
+  }
+
+  private cadenceActive(): boolean {
+    return this.speaking || Date.now() < this.speakingUntilMs;
+  }
+
+  /** Schedule the next send tick at the active or idle rate per VAD state. */
+  private scheduleNext(): void {
+    if (this.activeIntervalMs <= 0) return;
+    const delay = this.cadenceActive() ? this.activeIntervalMs : this.idleIntervalMs;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.tick();
+      this.scheduleNext();
+    }, delay);
+  }
+
+  /** Fire a send if there is buffered audio and no request is in flight. */
+  private tick(): void {
+    if (this.pendingAudio.length === 0) return;
+    this.dirty = true;
+    void this.processQueue();
   }
 
   /** Update the voice reference clips. Takes effect on the next request. */
@@ -293,11 +434,15 @@ export class GeminiAudioOrchestrator {
     this.pendingAudio.push(pcm);
     this.pendingBytes += pcm.byteLength;
     this.dirty = true;
-    void this.processQueue();
+    // In interval mode the timer paces requests; just buffer here. Otherwise
+    // (legacy VAD-triggered) send as soon as a turn arrives.
+    if (this.activeIntervalMs <= 0) void this.processQueue();
   }
 
-  /** No-op kept for API compatibility. */
-  close(): void {}
+  /** Stop the interval timer; safe to call when not running. */
+  close(): void {
+    this.stop();
+  }
 
   private async processQueue(): Promise<void> {
     if (this.inflight) return;
@@ -391,6 +536,10 @@ export class GeminiAudioOrchestrator {
     const json = (await res.json()) as GeminiResponse;
     const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text ?? '{"heard":"","cue":null}';
     const parsed = parseResponse(rawText);
+    // Reassemble the live transcript (delta mode) and overwrite parsed.heard
+    // with the full uncommitted text so downstream consumers and history see
+    // the whole thing, not just the delta.
+    parsed.heard = this.applyTranscript(parsed);
     const usage: GeminiUsage | undefined = json.usageMetadata
       ? {
           promptTokens: json.usageMetadata.promptTokenCount ?? 0,
@@ -402,6 +551,11 @@ export class GeminiAudioOrchestrator {
 
     let committed = false;
     if (parsed.cue) {
+      this.commit(parsed.heard, rawText, combined, parsed);
+      committed = true;
+    } else if (parsed.commit) {
+      // Empty-cue: a complete thought finished with nothing to highlight.
+      // Commit the transcript and truncate the window; no HUD cue.
       this.commit(parsed.heard, rawText, combined, parsed);
       committed = true;
     } else if (this.pendingBytes >= this.softCommitBytes) {
@@ -468,7 +622,17 @@ export class GeminiAudioOrchestrator {
     audioPcm: Uint8Array,
     parsed: AudioResponse,
   ): void {
-    this.dropInflight();
+    if (this.activeIntervalMs > 0) {
+      // Interval mode: keep a short trailing window of audio for continuity
+      // into the next request rather than discarding the whole committed slice.
+      this.inflightCount = 0;
+      this.truncateToTail(this.maxBufferAfterCommitBytes);
+    } else {
+      this.dropInflight();
+    }
+    // The committed text is the full reassembled transcript; the next window
+    // starts fresh.
+    this.liveTranscript = '';
     if (!heard) return;
     this.history.push({ role: 'user', parts: [{ text: heard }] });
     this.history.push({ role: 'model', parts: [{ text: rawText }] });
@@ -482,6 +646,36 @@ export class GeminiAudioOrchestrator {
       speakerNames: parsed.speakerNames,
       groupHint: parsed.groupHint,
     });
+  }
+
+  /**
+   * Apply a delta response to the live transcript and return the full
+   * uncommitted text. In 'full' mode the response already carries the whole
+   * window, so we just take it verbatim.
+   */
+  private applyTranscript(parsed: AudioResponse): string {
+    if (this.transcriptMode !== 'delta') {
+      this.liveTranscript = parsed.heard;
+      return parsed.heard;
+    }
+    let live = this.liveTranscript;
+    const replaces = parsed.replaces?.trim();
+    // Fail safe: only strip when it's an actual suffix of what we have.
+    if (replaces && live.endsWith(replaces)) {
+      live = live.slice(0, live.length - replaces.length).trimEnd();
+    }
+    const delta = parsed.heard.trim();
+    if (delta) live = live ? `${live} ${delta}` : delta;
+    this.liveTranscript = live;
+    return live;
+  }
+
+  /** Trim pendingAudio from the front so its total is ≤ maxBytes. */
+  private truncateToTail(maxBytes: number): void {
+    while (this.pendingBytes > maxBytes && this.pendingAudio.length > 1) {
+      const f = this.pendingAudio.shift()!;
+      this.pendingBytes -= f.byteLength;
+    }
   }
 
   /**
@@ -523,8 +717,12 @@ function parseResponse(raw: string): AudioResponse {
     // Force the contract: cueShort must be null when cue is null, regardless
     // of what the model emitted. (Cheaper than retraining the prompt.)
     const cueShort = cue ? cueShortRaw : null;
+    // Any cue forces a commit; empty-cue commits are flagged explicitly.
+    const commit = cue ? true : parsed.commit === true;
     return {
       heard: typeof parsed.heard === 'string' ? parsed.heard.trim() : '',
+      replaces: typeof parsed.replaces === 'string' ? parsed.replaces.trim() || undefined : undefined,
+      commit,
       cue,
       cueShort,
       segments: Array.isArray(parsed.segments)

@@ -452,6 +452,12 @@ button {
 .status-warn { color: var(--warn); font-size: 12px; }
 .status-pending { color: var(--text-muted); font-size: 11px; }
 
+.qr-badge {
+  display: block;
+  background: transparent;
+  image-rendering: pixelated;
+}
+
 .btn-row { display: flex; gap: var(--space-sm); }
 
 .btn {

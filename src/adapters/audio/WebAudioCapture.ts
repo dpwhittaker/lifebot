@@ -2,54 +2,19 @@ import { MicVAD } from '@ricky0123/vad-web';
 import type { GeminiAudioOrchestrator } from '../../orchestrator/GeminiAudio';
 import type { AudioCapture, AudioCaptureCallbacks } from './types';
 
-const SAMPLE_RATE = 16000;
-const HARD_CAP_MS = 30_000; // matches Gemini's per-request audio sweet spot
-const MERGE_THRESHOLDS = [
-  { uptoMs: 3_000, mergeMs: 1_500 }, // short utterances: be patient
-  { uptoMs: 6_000, mergeMs: 1_000 }, // medium: somewhat impatient
-  { uptoMs: Infinity, mergeMs: 400 }, // long: cut soon
-];
-const PRE_ROLL_FRAMES = 32; // ~1 second at 32ms/frame (Silero v5)
-
-function mergeMsFor(bufferMs: number): number {
-  for (const t of MERGE_THRESHOLDS) {
-    if (bufferMs < t.uptoMs) return t.mergeMs;
-  }
-  return MERGE_THRESHOLDS[MERGE_THRESHOLDS.length - 1].mergeMs;
-}
-
 /**
  * Browser-mic implementation of AudioCapture. Captures via @ricky0123/vad-web
- * (Silero in WASM) and ships each detected utterance to the orchestrator as a
- * single turn.
+ * (Silero in WASM).
  *
- * VAD acts as the *trigger* for what counts as a turn, but once a turn is
- * underway we accumulate **every** frame (including the quiet gaps between
- * VAD-detected speech segments) into the buffer that gets sent. That way
- * far-field words the VAD doesn't notice still ride along for Gemini to
- * pick up.
- *
- * vad-web's `redemptionMs` is fixed at construction, so we set it short and
- * stitch consecutive segments together here, with a merge timeout that
- * shrinks as the buffer grows: short utterances get a generous mid-sentence
- * pause budget; long monologues get cut sooner so we don't sit on a turn
- * forever.
+ * Every frame is streamed to the orchestrator continuously — silence included
+ * — so far-field/sub-threshold speech the VAD can't hear still reaches Gemini.
+ * The VAD's only role is *cadence*: speech detected → fast send interval;
+ * otherwise the orchestrator falls back to its idle rate.
  */
 export class WebAudioCapture implements AudioCapture {
   private vad?: MicVAD;
   private active = false;
   private wakeLock: WakeLockSentinel | null = null;
-
-  // Ring buffer of recent frames captured *before* the current turn began
-  // (used as pre-roll once a turn starts).
-  private preRoll: Float32Array[] = [];
-
-  // Continuous audio buffer for the current turn — every frame from pre-roll
-  // through final flush, including gaps between VAD-detected segments.
-  private turnBuffer: Float32Array[] = [];
-  private turnBytes = 0;
-  private turnActive = false;
-  private mergeTimer: ReturnType<typeof setTimeout> | null = null;
 
   private readonly orchestrator: GeminiAudioOrchestrator;
   private readonly cb: AudioCaptureCallbacks;
@@ -89,58 +54,27 @@ export class WebAudioCapture implements AudioCapture {
         redemptionMs: 350,
         preSpeechPadMs: 200,
 
-        // Capture every frame, not just VAD-detected segments. Whether to
-        // include it depends on whether a turn is currently active.
+        // Stream every frame to the orchestrator continuously — silence and
+        // all — so far-field/sub-threshold speech rides along for Gemini.
         onFrameProcessed: (_probs, frame) => {
-          if (this.turnActive) {
-            // Append every frame during an active turn — including silence
-            // between speech segments.
-            this.turnBuffer.push(frame);
-            this.turnBytes += frame.length;
-            // Hard cap protection (in case nothing ever flushes us).
-            const bufferMs = (this.turnBytes / SAMPLE_RATE) * 1000;
-            if (bufferMs >= HARD_CAP_MS) this.flushMerge('hard-cap');
-          } else {
-            // Outside a turn — keep a small rolling pre-roll so the first
-            // word isn't truncated when speech_start fires.
-            this.preRoll.push(frame);
-            if (this.preRoll.length > PRE_ROLL_FRAMES) this.preRoll.shift();
-          }
+          this.orchestrator.sendTurn(float32ToInt16(frame));
         },
 
+        // Speech{Start,End} drive cadence only (orchestrator.setSpeaking).
         onSpeechStart: () => {
           this.cb.onVadActive?.(true);
           this.cb.onVadEvent?.('speech_start');
-          if (!this.turnActive) {
-            // New turn — seed it with the pre-roll we've been collecting.
-            this.turnActive = true;
-            this.turnBuffer = this.preRoll.slice();
-            this.turnBytes = this.preRoll.reduce((s, f) => s + f.length, 0);
-            this.preRoll = [];
-          } else if (this.mergeTimer) {
-            // Mid-turn merge — speech resumed before flush fired.
-            clearTimeout(this.mergeTimer);
-            this.mergeTimer = null;
-            this.cb.onVadEvent?.('merge', {
-              bufferMs: Math.round((this.turnBytes / SAMPLE_RATE) * 1000),
-            });
-          }
+          this.orchestrator.setSpeaking(true);
         },
         onSpeechEnd: (audio) => {
           this.cb.onVadActive?.(false);
           this.cb.onVadEvent?.('speech_end', { samples: audio.length });
-          this.scheduleFlush();
+          this.orchestrator.setSpeaking(false);
         },
         onVADMisfire: () => {
           this.cb.onVadActive?.(false);
           this.cb.onVadEvent?.('misfire');
-          // Misfire after a fresh speech_start means that detected blip was
-          // too short to be real speech. If we just opened a turn for it,
-          // give the merge timer a chance to expire and ship what we have
-          // (which might still contain quiet far-field speech). If a turn
-          // was already underway, this is harmless noise — leave the turn
-          // running and let the merge timer keep scheduling.
-          if (this.turnActive) this.scheduleFlush();
+          this.orchestrator.setSpeaking(false);
         },
       });
     }
@@ -153,57 +87,18 @@ export class WebAudioCapture implements AudioCapture {
 
   async stop(): Promise<void> {
     this.vad?.pause();
-    this.flushMerge('stop');
+    this.orchestrator.setSpeaking(false);
     this.active = false;
     this.cb.onStatusChange?.(false);
     this.cb.onVadActive?.(false);
     this.releaseWakeLock();
     this.orchestrator.close();
-    this.preRoll = [];
   }
 
   async release(): Promise<void> {
     await this.stop();
     this.vad?.destroy();
     this.vad = undefined;
-  }
-
-  private scheduleFlush() {
-    if (this.mergeTimer) clearTimeout(this.mergeTimer);
-    if (!this.turnActive || this.turnBytes === 0) return;
-    const bufferMs = (this.turnBytes / SAMPLE_RATE) * 1000;
-    if (bufferMs >= HARD_CAP_MS) {
-      this.flushMerge('hard-cap');
-      return;
-    }
-    const delay = mergeMsFor(bufferMs);
-    this.mergeTimer = setTimeout(() => this.flushMerge('idle'), delay);
-  }
-
-  private flushMerge(reason: string) {
-    if (this.mergeTimer) {
-      clearTimeout(this.mergeTimer);
-      this.mergeTimer = null;
-    }
-    if (this.turnBytes === 0) {
-      this.turnActive = false;
-      return;
-    }
-    const total = new Float32Array(this.turnBytes);
-    let offset = 0;
-    for (const frame of this.turnBuffer) {
-      total.set(frame, offset);
-      offset += frame.length;
-    }
-    const bufferMs = Math.round((this.turnBytes / SAMPLE_RATE) * 1000);
-    this.turnBuffer = [];
-    this.turnBytes = 0;
-    this.turnActive = false;
-
-    this.cb.onVadEvent?.('flush', { bufferMs, reason });
-    const pcm = float32ToInt16(total);
-    this.orchestrator.sendTurn(pcm);
-    this.cb.onAudioSent?.(pcm.byteLength, Date.now());
   }
 
   private async requestWakeLock() {

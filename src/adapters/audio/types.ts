@@ -1,11 +1,10 @@
 export type AudioCaptureCallbacks = {
   onVadActive?: (active: boolean) => void;
-  onAudioSent?: (bytes: number, at: number) => void;
   onError?: (msg: string) => void;
   onStatusChange?: (active: boolean) => void;
   /** Per-event VAD trace for debugging. */
   onVadEvent?: (
-    kind: 'speech_start' | 'speech_end' | 'misfire' | 'merge' | 'flush',
+    kind: 'speech_start' | 'speech_end' | 'misfire',
     info?: { samples?: number; bufferMs?: number; reason?: string },
   ) => void;
 };

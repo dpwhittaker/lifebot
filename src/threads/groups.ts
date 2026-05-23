@@ -6,7 +6,8 @@
  * one-shot conversations. Its semantic is "temporary, move me out."
  */
 
-const BASE = '/lifebot/groups';
+const BASE =
+  (import.meta.env.VITE_LIFEBOT_GROUPS_URL as string | undefined) ?? '/lifebot/groups';
 
 export type Person = {
   id: string;

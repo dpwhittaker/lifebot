@@ -5,6 +5,7 @@ import { SileroV5 } from '@ricky0123/vad-web/dist/models/v5';
 import { defaultModelFetcher } from '@ricky0123/vad-web/dist/default-model-fetcher';
 import * as ort from 'onnxruntime-web/wasm';
 import {
+  type DeviceStatus,
   type EvenAppBridge,
   type EvenHubEvent,
   waitForEvenAppBridge,
@@ -16,21 +17,7 @@ import type { AudioCapture, AudioCaptureCallbacks } from './types';
 const SAMPLE_RATE = 16000;
 const FRAME_SAMPLES = 512; // Silero V5 frame size at 16 kHz → 32 ms
 const MS_PER_FRAME = (FRAME_SAMPLES / SAMPLE_RATE) * 1000;
-const HARD_CAP_MS = 30_000;
-const MERGE_THRESHOLDS = [
-  { uptoMs: 3_000, mergeMs: 1_500 },
-  { uptoMs: 6_000, mergeMs: 1_000 },
-  { uptoMs: Infinity, mergeMs: 400 },
-];
-const PRE_ROLL_FRAMES = 32; // ~1 s of 32 ms frames
 const BRIDGE_WAIT_TIMEOUT_MS = 1500;
-
-function mergeMsFor(bufferMs: number): number {
-  for (const t of MERGE_THRESHOLDS) {
-    if (bufferMs < t.uptoMs) return t.mergeMs;
-  }
-  return MERGE_THRESHOLDS[MERGE_THRESHOLDS.length - 1].mergeMs;
-}
 
 /**
  * Even-Hub bridge implementation of AudioCapture. Audio comes from the host
@@ -40,21 +27,21 @@ function mergeMsFor(bufferMs: number): number {
  *
  * Pipeline:
  *   bridge.audioPcm event  →  s16le → Float32
- *                          →  slice into 512-sample Silero V5 frames
- *                          →  vad-web `FrameProcessor`
- *                          →  same turn-shaping logic as WebAudioCapture
- *                          →  orchestrator.sendTurn(pcm)
+ *                          →  orchestrator.sendTurn(pcm)   (ALL audio, always)
+ *                          →  also sliced into 512-sample Silero V5 frames
+ *                          →  vad-web `FrameProcessor`  →  orchestrator.setSpeaking
  *
- * The merge / pre-roll behaviour mirrors WebAudioCapture deliberately: every
- * frame inside an active turn rides along (not just VAD-detected ones), so
- * quiet far-field words still reach Gemini. The two adapters are siblings;
- * either could be selected per build target.
+ * Every chunk of audio is streamed to the orchestrator unconditionally —
+ * silence included — so the model can resolve far-field/sub-threshold speech
+ * the VAD can't hear. The VAD's sole job here is *cadence*: speech detected →
+ * fast send interval; otherwise the orchestrator falls back to its idle rate.
  */
 export class G2AudioCapture implements AudioCapture {
   private bridge: EvenAppBridge | null = null;
   private model: Model | null = null;
   private frameProcessor: FrameProcessor | null = null;
   private unsubscribe: (() => void) | null = null;
+  private statusUnsubscribe: (() => void) | null = null;
 
   private active = false;
   private initialized = false;
@@ -67,12 +54,19 @@ export class G2AudioCapture implements AudioCapture {
   private pcmQueue: Float32Array[] = [];
   private processingQueue = false;
 
-  // Turn shaping (identical to WebAudioCapture).
-  private preRoll: Float32Array[] = [];
-  private turnBuffer: Float32Array[] = [];
-  private turnBytes = 0;
-  private turnActive = false;
-  private mergeTimer: ReturnType<typeof setTimeout> | null = null;
+  // Audio-stream watchdog. When the host stops delivering PCM (BLE
+  // hiccup, OS power throttle, wear sensor) the JS side just sees a
+  // sudden silence — VAD stops firing, the log goes quiet, the user
+  // thinks "it stopped listening". The watchdog catches that and
+  // attempts to bounce audioControl to revive the stream.
+  //
+  // Suppressed while the host has us backgrounded (FG_EXIT) — bouncing
+  // there spams the bridge with calls the host has already declined.
+  private lastPcmAt = 0;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private watchdogBouncing = false;
+  private watchdogFailedBounces = 0;
+  private suspendedByHost = false;
 
   private readonly orchestrator: GeminiAudioOrchestrator;
   private readonly cb: AudioCaptureCallbacks;
@@ -93,28 +87,131 @@ export class G2AudioCapture implements AudioCapture {
       this.cb.onError?.('G2 audio: bridge unavailable');
       return;
     }
+
+    // Probe device state up front. The host returns `false` from audioControl
+    // when the glasses aren't actually paired/awake; the bare boolean strips
+    // out the reason. Surface it so the user knows what to fix.
+    const deviceSummary = await this.describeDevice();
+    if (deviceSummary) {
+      this.cb.onError?.(`G2 device: ${deviceSummary}`);
+    }
+
     this.frameProcessor.resume();
     this.unsubscribe = this.bridge.onEvenHubEvent((evt) => this.onBridgeEvent(evt));
-    let ok = false;
-    try {
-      ok = await this.bridge.audioControl(true);
-    } catch (e) {
-      this.cb.onError?.(
-        `audioControl(true) threw: ${e instanceof Error ? e.message : String(e)}`,
-      );
-    }
+
+    // Subscribe to live device status pushes so the orchestrator log shows
+    // the wear/charge/connect state in real time. We no longer gate audio on
+    // any of these — they're informational only.
+    let lastStatusSummary = '';
+    this.statusUnsubscribe = this.bridge.onDeviceStatusChanged((status) => {
+      const summary = summarizeStatus(status);
+      if (summary !== lastStatusSummary) {
+        lastStatusSummary = summary;
+        this.cb.onError?.(`G2 status: ${summary}`);
+      }
+    });
+
+    const tryControl = async (): Promise<boolean> => {
+      try {
+        return await this.bridge!.audioControl(true);
+      } catch (e) {
+        this.cb.onError?.(
+          `audioControl(true) threw: ${e instanceof Error ? e.message : String(e)}`,
+        );
+        return false;
+      }
+    };
+
+    let ok = await tryControl();
     if (!ok) {
-      this.cb.onError?.('audioControl(true) returned false');
-      this.unsubscribe?.();
-      this.unsubscribe = null;
-      return;
+      // Host returned false (often because the wearing sensor hasn't tripped
+      // yet). Don't gate on it — start the audio pipeline anyway and let any
+      // audioPcm events that do arrive flow through. The orchestrator will
+      // simply see no turns if the mic stays dark.
+      const tail = deviceSummary ? ` (${deviceSummary})` : '';
+      this.cb.onError?.(
+        `audioControl(true) returned false${tail} — starting anyway; expect no audio until host accepts`,
+      );
     }
     this.active = true;
     this.cb.onStatusChange?.(true);
+    this.lastPcmAt = Date.now();
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = setInterval(() => void this.checkPcmStall(), 1500);
+  }
+
+  /** Bounce audioControl if the bridge has been silent for too long.
+   *  Skipped while the host has us backgrounded — the host won't
+   *  re-enable audio there and bouncing just spams the bridge. After
+   *  3 consecutive failed bounces the watchdog gives up until either
+   *  audio resumes (lastPcmAt updates) or the user explicitly toggles
+   *  via stop()/start(). */
+  private async checkPcmStall(): Promise<void> {
+    if (!this.active || !this.bridge || this.watchdogBouncing) return;
+    if (this.suspendedByHost) return; // backgrounded — host won't accept
+    if (this.watchdogFailedBounces >= 3) return; // gave up
+    const silentMs = Date.now() - this.lastPcmAt;
+    if (silentMs < 3000) return;
+    this.watchdogBouncing = true;
+    this.cb.onError?.(`audio stalled ${silentMs}ms — bouncing audioControl`);
+    try {
+      await this.bridge.audioControl(false);
+      await new Promise((r) => setTimeout(r, 150));
+      const ok = await this.bridge.audioControl(true);
+      this.cb.onError?.(`audioControl bounce → ${ok}`);
+      if (ok) {
+        this.watchdogFailedBounces = 0;
+      } else {
+        this.watchdogFailedBounces++;
+        if (this.watchdogFailedBounces >= 3) {
+          this.cb.onError?.(
+            'watchdog: 3 failed bounces — giving up. Use Stop/Start to retry.',
+          );
+        }
+      }
+      this.lastPcmAt = Date.now();
+    } catch (e) {
+      this.cb.onError?.(
+        `audioControl bounce threw: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      this.watchdogFailedBounces++;
+    } finally {
+      this.watchdogBouncing = false;
+    }
+  }
+
+  /** Called by App.tsx on FG_EXIT / FG_ENTER so the watchdog doesn't
+   *  fight a host pause. Resets the failure counter on resume so a
+   *  legitimate post-resume stall still gets one shot at recovery. */
+  setHostSuspended(suspended: boolean): void {
+    this.suspendedByHost = suspended;
+    if (!suspended) {
+      this.watchdogFailedBounces = 0;
+      // Don't reset lastPcmAt — let the watchdog's first post-resume tick
+      // pick up the real silence duration. PCM frames should resume
+      // within a second of FG_ENTER if the host is going to deliver.
+    }
+  }
+
+  /** Best-effort one-line summary of the paired G2 (or null if the host
+   *  doesn't expose it). Used to annotate audioControl failures. */
+  private async describeDevice(): Promise<string | null> {
+    if (!this.bridge) return null;
+    try {
+      const info = await this.bridge.getDeviceInfo();
+      if (!info) return 'no device paired';
+      return `${info.model} ${summarizeStatus(info.status)}`;
+    } catch (e) {
+      return `getDeviceInfo threw: ${e instanceof Error ? e.message : String(e)}`;
+    }
   }
 
   async stop(): Promise<void> {
     if (!this.active) return;
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
     if (this.bridge) {
       try {
         await this.bridge.audioControl(false);
@@ -124,17 +221,17 @@ export class G2AudioCapture implements AudioCapture {
     }
     this.unsubscribe?.();
     this.unsubscribe = null;
-    // Drain any in-flight VAD segment, then flush whatever the merge logic
-    // has buffered.
+    this.statusUnsubscribe?.();
+    this.statusUnsubscribe = null;
+    // Close out any open VAD segment so the next session starts clean.
     if (this.frameProcessor) {
       this.frameProcessor.endSegment((evt) => this.handleVadEvent(evt));
     }
-    this.flushMerge('stop');
+    this.orchestrator.setSpeaking(false);
     this.active = false;
     this.cb.onStatusChange?.(false);
     this.cb.onVadActive?.(false);
     this.orchestrator.close();
-    this.preRoll = [];
     this.residual = new Float32Array(0);
     this.pcmQueue = [];
   }
@@ -192,9 +289,18 @@ export class G2AudioCapture implements AudioCapture {
       model.process,
       model.reset_state,
       {
-        positiveSpeechThreshold: 0.45,
+        // Tuned for the G2's narrow-field directional mic, which captures
+        // own-voice loud but far-field/quiet voices at much lower SNR.
+        // Lowering the speech-positive threshold makes VAD fire on those
+        // quieter frames. Trade-off: more false-positive misfires (the
+        // orchestrator already filters misfires < minSpeechMs).
+        positiveSpeechThreshold: 0.3,
+        // Negative threshold isn't aggressively low — we want fast speech
+        // -end detection so the merge windows below can fire turns
+        // quickly. Quiet trailing-off speech may still get clipped; the
+        // mergeMs window will catch the next breath if there is one.
         negativeSpeechThreshold: 0.2,
-        redemptionMs: 350,
+        redemptionMs: 200,
         preSpeechPadMs: 200,
         minSpeechMs: 150,
         submitUserSpeechOnPause: false,
@@ -209,6 +315,13 @@ export class G2AudioCapture implements AudioCapture {
     if (!raw) return;
     const f32 = decodeAudioPcm(raw);
     if (f32.length === 0) return;
+    this.lastPcmAt = Date.now();
+    // Stream ALL audio to the orchestrator continuously — silence included —
+    // so the model can resolve far-field/sub-threshold speech the VAD misses.
+    // VAD no longer gates *which* audio is sent; it only gates cadence (see
+    // handleVadEvent → orchestrator.setSpeaking).
+    this.orchestrator.sendTurn(float32ToInt16(f32));
+    // Feed the same audio to the VAD for speech-detection (cadence) only.
     this.pcmQueue.push(f32);
     if (!this.processingQueue) void this.processQueue();
   }
@@ -240,88 +353,29 @@ export class G2AudioCapture implements AudioCapture {
     }
   }
 
+  /** VAD events drive cadence only — audio is already streamed continuously
+   *  in onBridgeEvent. SpeechStart → fast cadence; SpeechEnd/misfire → idle
+   *  (after the orchestrator's grace linger). */
   private handleVadEvent(event: FrameProcessorEvent): void {
     switch (event.msg) {
-      case Message.FrameProcessed: {
-        const frame = event.frame;
-        if (!frame) return;
-        if (this.turnActive) {
-          this.turnBuffer.push(frame);
-          this.turnBytes += frame.length;
-          const bufferMs = (this.turnBytes / SAMPLE_RATE) * 1000;
-          if (bufferMs >= HARD_CAP_MS) this.flushMerge('hard-cap');
-        } else {
-          this.preRoll.push(frame);
-          if (this.preRoll.length > PRE_ROLL_FRAMES) this.preRoll.shift();
-        }
-        break;
-      }
       case Message.SpeechStart:
         this.cb.onVadActive?.(true);
         this.cb.onVadEvent?.('speech_start');
-        if (!this.turnActive) {
-          this.turnActive = true;
-          this.turnBuffer = this.preRoll.slice();
-          this.turnBytes = this.preRoll.reduce((s, f) => s + f.length, 0);
-          this.preRoll = [];
-        } else if (this.mergeTimer) {
-          clearTimeout(this.mergeTimer);
-          this.mergeTimer = null;
-          this.cb.onVadEvent?.('merge', {
-            bufferMs: Math.round((this.turnBytes / SAMPLE_RATE) * 1000),
-          });
-        }
+        this.orchestrator.setSpeaking(true);
         break;
       case Message.SpeechEnd:
         this.cb.onVadActive?.(false);
         this.cb.onVadEvent?.('speech_end', { samples: event.audio?.length ?? 0 });
-        this.scheduleFlush();
+        this.orchestrator.setSpeaking(false);
         break;
       case Message.VADMisfire:
         this.cb.onVadActive?.(false);
         this.cb.onVadEvent?.('misfire');
-        if (this.turnActive) this.scheduleFlush();
+        this.orchestrator.setSpeaking(false);
         break;
-      // SpeechRealStart / SpeechStop / AudioFrame: not needed for turn shaping.
+      // FrameProcessed / SpeechRealStart / SpeechStop / AudioFrame: not needed
+      // — cadence keys off Speech{Start,End} only.
     }
-  }
-
-  private scheduleFlush() {
-    if (this.mergeTimer) clearTimeout(this.mergeTimer);
-    if (!this.turnActive || this.turnBytes === 0) return;
-    const bufferMs = (this.turnBytes / SAMPLE_RATE) * 1000;
-    if (bufferMs >= HARD_CAP_MS) {
-      this.flushMerge('hard-cap');
-      return;
-    }
-    const delay = mergeMsFor(bufferMs);
-    this.mergeTimer = setTimeout(() => this.flushMerge('idle'), delay);
-  }
-
-  private flushMerge(reason: string) {
-    if (this.mergeTimer) {
-      clearTimeout(this.mergeTimer);
-      this.mergeTimer = null;
-    }
-    if (this.turnBytes === 0) {
-      this.turnActive = false;
-      return;
-    }
-    const total = new Float32Array(this.turnBytes);
-    let offset = 0;
-    for (const frame of this.turnBuffer) {
-      total.set(frame, offset);
-      offset += frame.length;
-    }
-    const bufferMs = Math.round((this.turnBytes / SAMPLE_RATE) * 1000);
-    this.turnBuffer = [];
-    this.turnBytes = 0;
-    this.turnActive = false;
-
-    this.cb.onVadEvent?.('flush', { bufferMs, reason });
-    const pcm = float32ToInt16(total);
-    this.orchestrator.sendTurn(pcm);
-    this.cb.onAudioSent?.(pcm.byteLength, Date.now());
   }
 }
 
@@ -351,6 +405,15 @@ function decodeAudioPcm(raw: Uint8Array | number[] | string): Float32Array {
     out[i] = s < 0 ? s / 0x8000 : s / 0x7fff;
   }
   return out;
+}
+
+function summarizeStatus(s: DeviceStatus): string {
+  const bits = [`connect=${s.connectType}`];
+  if (typeof s.isWearing === 'boolean') bits.push(`worn=${s.isWearing}`);
+  if (typeof s.isInCase === 'boolean') bits.push(`incase=${s.isInCase}`);
+  if (typeof s.isCharging === 'boolean') bits.push(`chg=${s.isCharging}`);
+  if (typeof s.batteryLevel === 'number') bits.push(`batt=${s.batteryLevel}%`);
+  return bits.join(' ');
 }
 
 function base64ToBytes(b64: string): Uint8Array {
