@@ -58,7 +58,7 @@ src/
 
 Build outputs:
 - `npm run build:pwa` → `.serve/` (existing flow, no change)
-- `npm run dev:g2`    → serves `entry/g2.tsx` on the existing dev server; pair via `evenhub qr --url https://desktop-uqt6i2t.tail9fb1cb.ts.net/lifebot-g2/` (or local LAN URL during initial bring-up)
+- `npm run dev:g2`    → serves `entry/g2.tsx` on the existing dev server; pair via `evenhub qr --url https://<gpu-host>/lifebot-g2/` (or local LAN URL during initial bring-up)
 - `npm run build:g2`  → `.ehpk` via `evenhub-cli pack` (only needed if/when distributing to other users)
 
 The orchestrator already accepts PCM via `sendTurn(pcm: Uint8Array)`, so the audio adapter contract is small. The display adapter is even smaller — `showCue(text: string)` plus `clearCue()`. The current `CuePane` will become `DomCueRenderer` with a thin shim.
@@ -70,7 +70,7 @@ The orchestrator already accepts PCM via `sendTurn(pcm: Uint8Array)`, so the aud
 - VAD logic — Silero VAD WASM works in any modern WebView (Even Hub is Chromium-based)
 - System prompt building, cross-thread directory, group inference — all pure functions
 
-The home server (`tailnet-proxy` + thread/group/voiceprint storage) stays as-is. The G2 build calls into the same `https://desktop-uqt6i2t.tail9fb1cb.ts.net/lifebot/...` endpoints over the network; the WebView has standard `fetch`.
+The home server (reverse proxy + thread/group/voiceprint storage) stays as-is. The G2 build calls into the same `https://<gpu-host>/lifebot/...` endpoints over the network; the WebView has standard `fetch`.
 
 ## HUD UI — glance, don't read
 
@@ -161,7 +161,7 @@ Top row = "what's happening now" (transcript + DOM cues). Bottom row = "what the
 - [x] Acquire G2 hardware (arriving this week)
 - [ ] Install Even Hub iOS/Android app, pair G2 over BLE
 - [ ] `npm install -g @evenrealities/evenhub-cli`
-- [ ] Confirm the Even Hub WebView can reach `https://desktop-uqt6i2t.tail9fb1cb.ts.net/...` from the phone (Tailscale on the phone should make this transparent — `fetch()` from a stub page logs success/failure)
+- [ ] Confirm the Even Hub WebView can reach `https://<gpu-host>/...` from the phone (Tailscale on the phone should make this transparent — `fetch()` from a stub page logs success/failure)
 - [ ] Run a hello-world from `evenhub-templates/asr` against `evenhub qr --url <local-vite-url>` — confirms mic + HUD both work end-to-end via the dev-mode QR flow
 - [ ] Capture a short PCM clip via `audioEvent.audioPcm`, dump to file/console — measure frame size and cadence to confirm Silero VAD-web compatibility
 
@@ -183,12 +183,12 @@ This collapses what was Phase 3-real into a no-hardware task: write the real bri
 
 **How to run end-to-end (no glasses needed):**
 ```bash
-# 1. Vite dev server (in WSL2)
+# 1. Vite dev server
 npm run dev                                   # → http://localhost:5174
 
-# 2. Simulator (separate terminal, also in WSL2)
+# 2. Simulator (separate terminal)
 DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 \
-XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir \
+XDG_RUNTIME_DIR=/run/user/$(id -u) \
 evenhub-simulator -g http://localhost:5174 --automation-port 9898
 
 # 3. The simulator window opens, loads the PWA. The PWA detects the bridge,
@@ -257,7 +257,7 @@ Renderer is **already written and validated against the simulator** in Phase 2-s
 
 ## Open questions to answer in Phase 0/1
 
-1. Does the WebView allow arbitrary HTTPS to `desktop-uqt6i2t.tail9fb1cb.ts.net` over the user's phone tailnet? (Tailscale on the phone should make it transparent, but confirm.) Note: CORS is enforced by the WebView even with the `network` permission; the home server already serves same-origin so this should be a non-issue, but verify.
+1. Does the WebView allow arbitrary HTTPS to `<gpu-host>` over the user's phone tailnet? (Tailscale on the phone should make it transparent, but confirm.) Note: CORS is enforced by the WebView even with the `network` permission; the home server already serves same-origin so this should be a non-issue, but verify.
 2. PCM frame size and cadence from `audioEvent.audioPcm` — does Silero VAD-web work directly on those frames, or does it need rebuffering?
 3. ~~How does `TextContainerProperty.upgrade()` handle rapid successive calls — debounce required, or built-in?~~ **Answered:** debounce required, ≥120 ms (Even's own ASR template).
 4. Image/list containers — useful for showing speaker name + cue together, or overkill?

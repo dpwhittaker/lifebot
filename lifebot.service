@@ -7,7 +7,11 @@ After=network.target
 Type=simple
 User=david
 WorkingDirectory=/home/david/projects/lifebot
-ExecStart=/home/david/.nvm/versions/node/v24.11.0/bin/node /home/david/projects/lifebot/server.cjs
+# Source nvm inline rather than hardcoding a version path: a login shell alone
+# won't load nvm non-interactively, and pinning
+# .nvm/versions/node/<version>/bin breaks silently on every Node upgrade.
+# This follows whatever nvm's `default` alias points at.
+ExecStart=/bin/bash -lc 'export NVM_DIR=$HOME/.nvm && . $NVM_DIR/nvm.sh && exec node server.cjs'
 Environment=LIFEBOT_PORT=8003
 Restart=always
 RestartSec=2

@@ -87,14 +87,12 @@ Iteration is essentially: edit, save, browser HMRs the change. No install dialog
 
 ## Deployment (private tailnet)
 
-The build output is a static site and is served by the existing `lifebot-static.service` (`python3 -m http.server 8003 --directory .serve`). That service is fronted by the path-routed reverse proxy at `~/projects/proxy/` (read its AGENTS.md for the full story).
-
-Relevant routes on the proxy:
+`lifebot.service` runs `server.cjs` on `127.0.0.1:8003` (`LIFEBOT_PORT`). It serves the built static site out of `.serve/` **and** owns the app's own API routes. On the dev host it sits behind a path-based reverse proxy at `/lifebot/` with the prefix stripped, but nothing here depends on which proxy that is — the only contract is "something forwards `/lifebot/*` to `127.0.0.1:8003` with the prefix removed."
 
 | URL | Backend | Notes |
 |---|---|---|
-| `/lifebot/` | `127.0.0.1:8003` (`lifebot-static.service`) | Serves `.serve/` after `npm run build`. Prefix stripped. |
-| `POST /lifebot/logs` | handled by the proxy itself | Appends body lines to `~/projects/lifebot/logs/current.log`. |
+| `/lifebot/` | `127.0.0.1:8003` (`lifebot.service`) | Serves `.serve/` after `npm run build`. Prefix stripped. |
+| `POST /lifebot/logs` | `server.cjs` (see the `/logs` handler) | Appends body lines to `logs/current.log`. Handled by this app, **not** by the proxy. |
 
 The tailnet hostname is *not* committed anywhere in this repo (per the `gpu-server` SSH alias convention in `~/.claude/CLAUDE.md`). Use `gpu-server` or `<gpu-host>` when documenting publicly. The user's own browser bookmark holds the real FQDN.
 
@@ -109,7 +107,7 @@ If you change anything in `public/` (icons, manifest, VAD model), they get copie
 
 ## Log upload
 
-Runtime device-side events (connection state, per-turn transcripts, errors) get POSTed in 5-second batches to `/lifebot/logs`. The proxy handler in `~/projects/proxy/server.js` writes each line to `~/projects/lifebot/logs/current.log` with a server-side timestamp prefix. `tail -f` it for live device debugging.
+Runtime device-side events (connection state, per-turn transcripts, errors) get POSTed in 5-second batches to `/lifebot/logs`. The `/logs` handler in this repo's `server.cjs` writes each line to `logs/current.log` with a server-side timestamp prefix. `tail -f` it for live device debugging. (This used to live in the reverse proxy; it moved into the app so lifebot is self-contained.)
 
 The logs dir is intentionally outside `.serve/` — that dir is the build output and gets emptied on every `npm run build`.
 
