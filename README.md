@@ -1,5 +1,5 @@
 ---
-tags: [Assistant, WIP]
+tags: [AI]
 ---
 
 # LifeBot
