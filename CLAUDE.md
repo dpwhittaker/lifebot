@@ -1,4 +1,4 @@
-# LifeBot — AGENTS.md
+# LifeBot — CLAUDE.md
 
 Read this before making changes. It's the orientation doc for anyone (human or agent) picking the project up cold.
 
